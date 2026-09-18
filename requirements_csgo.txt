@@ -1,0 +1,5 @@
+# Extra distributions absent from the cloned ControlAR-compatible environment.
+# The setup script installs these only when their imports are unavailable.
+sentencepiece==0.2.0
+h5py==3.11.0
+imgaug==0.4.0

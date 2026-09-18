@@ -169,6 +169,7 @@ logs/
 
 # Output
 outs/
+outputs/csgo_benchmark_v2_seen10/
 
 # Checkpoints
 checkpoints/

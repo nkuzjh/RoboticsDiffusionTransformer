@@ -14,9 +14,11 @@
 # See the License for the specific language governing permissions and
 
 import copy
+import json
 import logging
 import math
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import diffusers
@@ -26,6 +28,10 @@ import transformers
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, set_seed
+try:
+    from accelerate.utils import DataLoaderConfiguration
+except ImportError:  # accelerate < 0.26
+    DataLoaderConfiguration = None
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
 from huggingface_hub import create_repo, upload_folder
@@ -77,10 +83,27 @@ def train(args, logger):
     with open(args.config_path, "r") as fp:
         config = yaml.safe_load(fp)
 
+    # CSGO is an explicit opt-in.  The native path below remains unchanged for
+    # all existing RDT datasets; only its construction/data/eval calls branch
+    # when a benchmark root (or a YAML ``csgo`` mapping) is present.
+    csgo_config = config.get("csgo") if isinstance(config, dict) else None
+    is_csgo = bool(getattr(args, "csgo_data_root", None) or csgo_config)
+    csgo_hooks = None
+    csgo_output_dir = getattr(args, "csgo_output_dir", None) or args.output_dir
+
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
     accelerator = Accelerator(
+        cpu=bool(getattr(args, "csgo_cpu", False)) if is_csgo else False,
+        dataloader_config=(
+            DataLoaderConfiguration(
+                use_seedable_sampler=True,
+                data_seed=int(args.seed or 0),
+            )
+            if is_csgo and DataLoaderConfiguration is not None
+            else None
+        ),
         deepspeed_plugin=DeepSpeedPlugin(
             hf_ds_config=args.deepspeed
         ) if args.deepspeed is not None else None,
@@ -113,10 +136,17 @@ def train(args, logger):
     if args.seed is not None:
         set_seed(args.seed)
 
+    if is_csgo:
+        from train import csgo_hooks as _csgo_hooks
+
+        csgo_hooks = _csgo_hooks
+
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+        if is_csgo and csgo_output_dir is not None:
+            os.makedirs(csgo_output_dir, exist_ok=True)
 
         if args.push_to_hub:
             repo_id = create_repo(
@@ -131,62 +161,72 @@ def train(args, logger):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     
-    if args.precomp_lang_embed:
-        tokenizer, text_encoder = None, None
+    if is_csgo:
+        components = csgo_hooks.build_csgo_components(args, config, accelerator, logger)
+        rdt = components["rdt"]
+        vision_encoder = components["vision_encoder"]
+        image_processor = components["image_processor"]
+        tokenizer = components["tokenizer"]
+        text_encoder = components["text_encoder"]
+        weight_dtype = components["weight_dtype"]
+        ema_rdt = None
+        ema_model = None
     else:
-        text_embedder = T5Embedder(from_pretrained=args.pretrained_text_encoder_name_or_path, 
-                                model_max_length=config["dataset"]["tokenizer_max_length"], device=accelerator.device)
-        tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
+        if args.precomp_lang_embed:
+            tokenizer, text_encoder = None, None
+        else:
+            text_embedder = T5Embedder(from_pretrained=args.pretrained_text_encoder_name_or_path,
+                                    model_max_length=config["dataset"]["tokenizer_max_length"], device=accelerator.device)
+            tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 
-    vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
-    image_processor = vision_encoder.image_processor
+        vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
+        image_processor = vision_encoder.image_processor
 
-    # Load from a pretrained checkpoint
-    if (
-        args.pretrained_model_name_or_path is not None
-        and not os.path.isfile(args.pretrained_model_name_or_path)
-    ):
-        logger.info("Constructing model from pretrained checkpoint.")
-        rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
-    else:
-        logger.info("Constructing model from provided config.")
-        # Calculate the image condition length
-        img_cond_len = (config["common"]["img_history_size"] 
-                        * config["common"]["num_cameras"] 
-                        * vision_encoder.num_patches)
-        rdt = RDTRunner(
-            action_dim=config["common"]["state_dim"],
-            pred_horizon=config["common"]["action_chunk_size"],
-            config=config["model"],
-            lang_token_dim=config["model"]["lang_token_dim"],
-            img_token_dim=config["model"]["img_token_dim"],
-            state_token_dim=config["model"]["state_token_dim"],
-            max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
-            img_cond_len=img_cond_len,
-            img_pos_embed_config=[
-                # No initial pos embed in the last grid size
-                # since we've already done in ViT
-                ("image", (config["common"]["img_history_size"], 
-                    config["common"]["num_cameras"], 
-                    -vision_encoder.num_patches)),  
-            ],
-            lang_pos_embed_config=[
-                # Similarly, no initial pos embed for language
-                ("lang", -config["dataset"]["tokenizer_max_length"]),
-            ],
-            dtype=weight_dtype,
+        # Load from a pretrained checkpoint
+        if (
+            args.pretrained_model_name_or_path is not None
+            and not os.path.isfile(args.pretrained_model_name_or_path)
+        ):
+            logger.info("Constructing model from pretrained checkpoint.")
+            rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
+        else:
+            logger.info("Constructing model from provided config.")
+            # Calculate the image condition length
+            img_cond_len = (config["common"]["img_history_size"]
+                            * config["common"]["num_cameras"]
+                            * vision_encoder.num_patches)
+            rdt = RDTRunner(
+                action_dim=config["common"]["state_dim"],
+                pred_horizon=config["common"]["action_chunk_size"],
+                config=config["model"],
+                lang_token_dim=config["model"]["lang_token_dim"],
+                img_token_dim=config["model"]["img_token_dim"],
+                state_token_dim=config["model"]["state_token_dim"],
+                max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
+                img_cond_len=img_cond_len,
+                img_pos_embed_config=[
+                    # No initial pos embed in the last grid size
+                    # since we've already done in ViT
+                    ("image", (config["common"]["img_history_size"],
+                        config["common"]["num_cameras"],
+                        -vision_encoder.num_patches)),
+                ],
+                lang_pos_embed_config=[
+                    # Similarly, no initial pos embed for language
+                    ("lang", -config["dataset"]["tokenizer_max_length"]),
+                ],
+                dtype=weight_dtype,
+            )
+
+        ema_rdt = copy.deepcopy(rdt)
+        ema_model = EMAModel(
+            ema_rdt,
+            update_after_step=config["model"]["ema"]["update_after_step"],
+            inv_gamma=config["model"]["ema"]["inv_gamma"],
+            power=config["model"]["ema"]["power"],
+            min_value=config["model"]["ema"]["min_value"],
+            max_value=config["model"]["ema"]["max_value"]
         )
-        
-                                                                       
-    ema_rdt = copy.deepcopy(rdt)
-    ema_model = EMAModel(
-        ema_rdt,
-        update_after_step=config["model"]["ema"]["update_after_step"],
-        inv_gamma=config["model"]["ema"]["inv_gamma"],
-        power=config["model"]["ema"]["power"],
-        min_value=config["model"]["ema"]["min_value"],
-        max_value=config["model"]["ema"]["max_value"]
-    )
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     # which ensure saving model in huggingface format (config.json + pytorch_model.bin)
@@ -236,38 +276,82 @@ def train(args, logger):
         eps=args.adam_epsilon,
     )
     
-    # Dataset and DataLoaders creation:                                                           
-    train_dataset = VLAConsumerDataset(
-        config=config["dataset"],
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        num_cameras=config["common"]["num_cameras"],
-        img_history_size=config["common"]["img_history_size"],
-        dataset_type=args.dataset_type,
-        image_aug=args.image_aug,
-        cond_mask_prob=args.cond_mask_prob,
-        cam_ext_mask_prob=args.cam_ext_mask_prob,
-        state_noise_snr=args.state_noise_snr,
-        use_hdf5=args.load_from_hdf5,
-        use_precomp_lang_embed=args.precomp_lang_embed,
-    )
-    sample_dataset = VLAConsumerDataset(
-        config=config["dataset"],
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        num_cameras=config["common"]["num_cameras"],
-        img_history_size=config["common"]["img_history_size"],
-        dataset_type=args.dataset_type,
-        image_aug=False,
-        cond_mask_prob=0,
-        cam_ext_mask_prob=-1,
-        state_noise_snr=None,
-        use_hdf5=args.load_from_hdf5,
-        use_precomp_lang_embed=args.precomp_lang_embed,
-    )                              
+    # Dataset and DataLoaders creation:
+    if is_csgo:
+        from data.csgo_seen10 import Seen10Dataset, collate_seen10
+
+        data_root = getattr(args, "csgo_data_root", None)
+        if data_root is None and isinstance(csgo_config, Mapping):
+            data_root = csgo_config.get("data_root") or csgo_config.get("data_root_path")
+        if data_root is None:
+            raise ValueError("CSGO opt-in requires --csgo_data_root or csgo.data_root")
+        language_embeddings = components["language_embeddings"]
+        train_limit = getattr(args, "csgo_train_limit_per_map", None)
+        eval_limit = getattr(args, "csgo_eval_limit_per_map", None)
+        train_dataset = Seen10Dataset(
+            data_root,
+            "seen_train",
+            image_processor,
+            language_embeddings=language_embeddings,
+            tokenizer=tokenizer,
+            state_dim=128,
+            limit_per_map=train_limit,
+        )
+        sample_dataset = Seen10Dataset(
+            data_root,
+            "seen_validation",
+            image_processor,
+            language_embeddings=language_embeddings,
+            tokenizer=tokenizer,
+            state_dim=128,
+            limit_per_map=eval_limit,
+        )
+        data_collator = collate_seen10
+    else:
+        train_dataset = VLAConsumerDataset(
+            config=config["dataset"],
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            num_cameras=config["common"]["num_cameras"],
+            img_history_size=config["common"]["img_history_size"],
+            dataset_type=args.dataset_type,
+            image_aug=args.image_aug,
+            cond_mask_prob=args.cond_mask_prob,
+            cam_ext_mask_prob=args.cam_ext_mask_prob,
+            state_noise_snr=args.state_noise_snr,
+            use_hdf5=args.load_from_hdf5,
+            use_precomp_lang_embed=args.precomp_lang_embed,
+        )
+        sample_dataset = VLAConsumerDataset(
+            config=config["dataset"],
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            num_cameras=config["common"]["num_cameras"],
+            img_history_size=config["common"]["img_history_size"],
+            dataset_type=args.dataset_type,
+            image_aug=False,
+            cond_mask_prob=0,
+            cam_ext_mask_prob=-1,
+            state_noise_snr=None,
+            use_hdf5=args.load_from_hdf5,
+            use_precomp_lang_embed=args.precomp_lang_embed,
+        )
+
+        data_collator = DataCollatorForVLAConsumerDataset(tokenizer)
     
-    data_collator = DataCollatorForVLAConsumerDataset(tokenizer)                                                        
-    
+    # A PyTorch DataLoader iterator draws its worker/base seed from the
+    # default torch RNG even with ``num_workers=0``.  CSGO resume restores the
+    # model RNG and then replays consumed batches, so give each loader its own
+    # generator to keep that replay from consuming one extra diffusion-noise
+    # draw before the first resumed update.
+    train_loader_generator = None
+    sample_loader_generator = None
+    if is_csgo:
+        train_loader_generator = torch.Generator(device="cpu")
+        train_loader_generator.manual_seed(int(args.seed or 0) + 1)
+        sample_loader_generator = torch.Generator(device="cpu")
+        sample_loader_generator.manual_seed(int(args.seed or 0) + 2)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -275,21 +359,25 @@ def train(args, logger):
         collate_fn=data_collator,
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=args.dataloader_num_workers > 0,
+        generator=train_loader_generator,
     )
     sample_dataloader = torch.utils.data.DataLoader(
         sample_dataset,
         batch_size=args.sample_batch_size,
-        shuffle=True,
+        shuffle=not is_csgo,
         collate_fn=data_collator,
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=args.dataloader_num_workers > 0,
+        generator=sample_loader_generator,
     )
     
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if is_csgo and getattr(args, "csgo_smoke", False) and args.max_train_steps is None:
+        args.max_train_steps = 5
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -304,11 +392,19 @@ def train(args, logger):
     )
 
     # Prepare everything with our `accelerator`.
-    rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
-        rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler                   
-    )
+    if is_csgo:
+        # Keep validation unsharded so rank zero evaluates the complete
+        # Seen-10 split and can render all fixed per-map samples.
+        rdt, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            rdt, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
+            rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler
+        )
 
-    ema_rdt.to(accelerator.device, dtype=weight_dtype)                                                                             
+    if ema_rdt is not None:
+        ema_rdt.to(accelerator.device, dtype=weight_dtype)
 
     if text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -322,6 +418,42 @@ def train(args, logger):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    if is_csgo:
+        if args.max_train_steps < 5 or args.max_train_steps % 5 != 0:
+            raise ValueError(
+                "CSGO max_train_steps must be a positive multiple of five so eval/save occur exactly five times"
+            )
+        args.checkpointing_period = args.max_train_steps // 5
+        # The CSGO branch performs full validation at this same interval.
+        args.sample_period = args.checkpointing_period
+
+    csgo_metadata = None
+    if is_csgo:
+        embedding_path = getattr(args, "csgo_language_embeddings", None)
+        if not isinstance(embedding_path, (str, os.PathLike)):
+            embedding_path = None
+        csgo_metadata = {
+            "task": "csgo_seen10_localization",
+            "status": "running",
+            "smoke_only": bool(getattr(args, "csgo_smoke", False)),
+            "data_root": getattr(args, "csgo_data_root", None),
+            "language_embeddings": os.fspath(embedding_path) if embedding_path is not None else None,
+            "seed": args.seed,
+            "max_train_steps": args.max_train_steps,
+            "checkpoint_interval": args.checkpointing_period,
+            "eval_save_passes": 5,
+            "active_action_dim": 5,
+            "action_dim": 128,
+            "pred_horizon": 1,
+            "config": config,
+            "args": vars(args),
+        }
+        if accelerator.is_main_process:
+            csgo_hooks.write_run_metadata(
+                os.path.join(csgo_output_dir, "training_metadata.json"),
+                csgo_metadata,
+            )
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -344,25 +476,39 @@ def train(args, logger):
     
     # Load from a pretrained checkpoint
     if (
-        args.resume_from_checkpoint is None 
+        not is_csgo
+        and
+        args.resume_from_checkpoint is None
         and args.pretrained_model_name_or_path is not None
         and os.path.isfile(args.pretrained_model_name_or_path)
     ):
         # Since EMA is deprecated, we do not load EMA from the pretrained checkpoint
         logger.info("Loading from a pretrained checkpoint.")
         checkpoint = torch.load(args.pretrained_model_name_or_path)
-        rdt.module.load_state_dict(checkpoint["module"])
+        accelerator.unwrap_model(rdt).load_state_dict(checkpoint["module"])
    
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
+        resume_path = None
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            candidate = Path(args.resume_from_checkpoint)
+            if not candidate.is_absolute():
+                candidate = Path(args.output_dir) / candidate
+            if candidate.is_symlink():
+                candidate = candidate.resolve()
+            if candidate.is_dir():
+                resume_path = candidate
+                path = candidate.name
+            else:
+                path = candidate.name
         else:
             # Get the mos recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
+            if path is not None:
+                resume_path = Path(args.output_dir) / path
 
         if path is None:
             accelerator.print(
@@ -371,16 +517,24 @@ def train(args, logger):
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            try:
-                accelerator.load_state(os.path.join(args.output_dir, path)) # load_module_strict=False
-            except:
-                # load deepspeed's state_dict
-                logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
-                checkpoint = torch.load(os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
-                rdt.module.load_state_dict(checkpoint["module"])
-                
-            load_model(ema_rdt, os.path.join(args.output_dir, path, "ema", "model.safetensors"))
-            global_step = int(path.split("-")[1])
+            checkpoint_path = os.fspath(resume_path or (Path(args.output_dir) / path))
+            if is_csgo:
+                # CSGO resume must restore optimizer/scheduler and RNG as one
+                # native Accelerator state; a model-only fallback would make
+                # the resumed run numerically incomparable.
+                accelerator.load_state(checkpoint_path)
+            else:
+                try:
+                    accelerator.load_state(checkpoint_path) # load_module_strict=False
+                except Exception:
+                    # load deepspeed's state_dict
+                    logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
+                    checkpoint = torch.load(os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
+                    accelerator.unwrap_model(rdt).load_state_dict(checkpoint["module"])
+
+            if ema_rdt is not None:
+                load_model(ema_rdt, os.path.join(checkpoint_path, "ema", "model.safetensors"))
+            global_step = int(Path(checkpoint_path).name.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
@@ -391,8 +545,74 @@ def train(args, logger):
     progress_bar.set_description("Steps")
 
     loss_for_log = {}
+    csgo_loss_path = os.path.join(csgo_output_dir, "train_loss.jsonl") if is_csgo else None
+    csgo_best_mse = float("inf")
+    csgo_best_checkpoint = None
+    if is_csgo:
+        best_record = os.path.join(csgo_output_dir, "best_validation.json")
+        if os.path.isfile(best_record):
+            try:
+                with open(best_record, "r", encoding="utf-8") as stream:
+                    previous = json.load(stream)
+                csgo_best_mse = float(previous.get("mse", float("inf")))
+                csgo_best_checkpoint = previous.get("checkpoint")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+    def complete_csgo_validation(step, checkpoint_path):
+        """Validate one native CSGO checkpoint and update its aliases."""
+
+        nonlocal csgo_best_mse, csgo_best_checkpoint
+        eval_dir = os.path.join(csgo_output_dir, "validation", f"step-{step}")
+        metrics_path = os.path.join(eval_dir, "metrics.json")
+        if os.path.isfile(metrics_path):
+            with open(metrics_path, "r", encoding="utf-8") as stream:
+                sample_result = json.load(stream)
+        else:
+            sample_result = csgo_hooks.evaluate_localization(
+                accelerator.unwrap_model(rdt),
+                sample_dataloader,
+                vision_encoder=vision_encoder,
+                text_encoder=text_encoder,
+                accelerator=accelerator,
+                dtype=weight_dtype,
+                output_dir=eval_dir,
+                dataset=sample_dataset,
+                step=step,
+                seed=getattr(args, "csgo_visualization_seed", 0),
+                per_map=10,
+                render=True,
+            )
+            sample_result["step"] = step
+            sample_result["checkpoint"] = checkpoint_path
+            csgo_hooks.write_run_metadata(metrics_path, sample_result)
+
+        if sample_result["mse"] < csgo_best_mse:
+            csgo_best_mse = sample_result["mse"]
+            csgo_best_checkpoint = checkpoint_path
+            csgo_hooks.write_run_metadata(
+                os.path.join(csgo_output_dir, "best_validation.json"),
+                {"mse": csgo_best_mse, "checkpoint": csgo_best_checkpoint, "step": step},
+            )
+        csgo_hooks.update_checkpoint_alias(args.output_dir, "late", checkpoint_path)
+        if csgo_best_checkpoint:
+            csgo_hooks.update_checkpoint_alias(args.output_dir, "best", csgo_best_checkpoint)
+
+    # Saving state precedes validation.  If a process stopped during the
+    # validation of the resumed checkpoint, finish that exact validation
+    # before consuming another training batch.  Existing metrics are reused.
+    if is_csgo and args.resume_from_checkpoint and global_step > 0:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            complete_csgo_validation(global_step, checkpoint_path)
+        accelerator.wait_for_everyone()
+
     for epoch in range(first_epoch, args.num_train_epochs):
 
+        # A checkpoint at the requested terminal step is already complete.
+        # Do not enter its epoch and consume one more batch on resume.
+        if global_step >= args.max_train_steps:
+            break
         rdt.train()
         
         # Set the progress_bar to correct position
@@ -400,39 +620,59 @@ def train(args, logger):
             progress_bar.update(resume_step // args.gradient_accumulation_steps)
         
         # Forward and backward...
-        for batch in train_dataloader:
+        if is_csgo and hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(epoch)
+        for batch_index, batch in enumerate(train_dataloader):
+            if global_step >= args.max_train_steps:
+                break
+            # Restore the exact optimizer/micro-batch position.  The sampler
+            # is seeded per epoch above, so this consumes the same shuffled
+            # prefix after a restart before the first backward pass.
+            if args.resume_from_checkpoint and epoch == first_epoch and batch_index < resume_step:
+                continue
             with accelerator.accumulate(rdt):
-                images = batch["images"].to(dtype=weight_dtype)
-                states = batch["states"].to(dtype=weight_dtype) # (B, T, D_a)
-                # We only use the last state as input
-                states = states[:, -1:, :]
-                actions = batch["actions"].to(dtype=weight_dtype)
-                state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
-                ctrl_freqs = batch["ctrl_freqs"]
-                    
-                with torch.no_grad():
-                    batch_size, _, C, H, W = images.shape
-                    image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
-                    image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+                if is_csgo:
+                    prepared = csgo_hooks.prepare_csgo_batch(
+                        batch,
+                        vision_encoder=vision_encoder,
+                        text_encoder=text_encoder,
+                        accelerator=accelerator,
+                        dtype=weight_dtype,
+                        training=True,
+                    )
+                    loss = rdt(**prepared)
+                else:
+                    images = batch["images"].to(dtype=weight_dtype)
+                    states = batch["states"].to(dtype=weight_dtype) # (B, T, D_a)
+                    # We only use the last state as input
+                    states = states[:, -1:, :]
+                    actions = batch["actions"].to(dtype=weight_dtype)
+                    state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
+                    ctrl_freqs = batch["ctrl_freqs"]
 
-                    lang_attn_mask = batch["lang_attn_mask"]
-                    text_embeds = batch["lang_embeds"].to(dtype=weight_dtype) \
-                        if args.precomp_lang_embed \
-                        else text_encoder(
-                            input_ids=batch["input_ids"],
-                            attention_mask=lang_attn_mask
-                        )["last_hidden_state"].detach()
-                
-                state_elem_mask = state_elem_mask.unsqueeze(1)
-                loss = rdt(
-                    lang_tokens=text_embeds,
-                    lang_attn_mask=lang_attn_mask,
-                    img_tokens=image_embeds,
-                    state_tokens=states,
-                    action_gt=actions,
-                    action_mask=state_elem_mask,
-                    ctrl_freqs=ctrl_freqs
-                )
+                    with torch.no_grad():
+                        batch_size, _, C, H, W = images.shape
+                        image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
+                        image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+
+                        lang_attn_mask = batch["lang_attn_mask"]
+                        text_embeds = batch["lang_embeds"].to(dtype=weight_dtype) \
+                            if args.precomp_lang_embed \
+                            else text_encoder(
+                                input_ids=batch["input_ids"],
+                                attention_mask=lang_attn_mask
+                            )["last_hidden_state"].detach()
+
+                    state_elem_mask = state_elem_mask.unsqueeze(1)
+                    loss = rdt(
+                        lang_tokens=text_embeds,
+                        lang_attn_mask=lang_attn_mask,
+                        img_tokens=image_embeds,
+                        state_tokens=states,
+                        action_gt=actions,
+                        action_mask=state_elem_mask,
+                        ctrl_freqs=ctrl_freqs
+                    )
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -442,7 +682,8 @@ def train(args, logger):
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
             
-            ema_model.step(accelerator.unwrap_model(rdt))
+            if ema_model is not None:
+                ema_model.step(accelerator.unwrap_model(rdt))
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -451,31 +692,61 @@ def train(args, logger):
 
                 if global_step % args.checkpointing_period == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    if is_csgo:
+                        # Only rank zero performs the collision check.  Every
+                        # rank then enters save_state together, avoiding a
+                        # rank-one race after rank zero creates the directory.
+                        if accelerator.is_main_process and os.path.exists(save_path):
+                            raise FileExistsError(
+                                f"Refusing to overwrite existing CSGO checkpoint: {save_path}; resume or choose a new run"
+                            )
+                        accelerator.wait_for_everyone()
                     accelerator.save_state(save_path)
-                    ema_save_path = os.path.join(save_path, f"ema")
-                    accelerator.save_model(ema_rdt, ema_save_path)
+                    if is_csgo and getattr(args, "csgo_smoke", False) and accelerator.is_main_process:
+                        csgo_hooks.write_run_metadata(
+                            os.path.join(save_path, "smoke_only.json"),
+                            {"smoke_only": True, "seed": args.seed},
+                        )
+                    if is_csgo:
+                        accelerator.wait_for_everyone()
+                    if ema_rdt is not None:
+                        ema_save_path = os.path.join(save_path, f"ema")
+                        accelerator.save_model(ema_rdt, ema_save_path)
                     logger.info(f"Saved state to {save_path}")
 
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
-                    sample_loss_for_log = log_sample_res(
-                        text_encoder,
-                        vision_encoder,
-                        rdt,    # We do not use EMA currently
-                        args,
-                        accelerator,
-                        weight_dtype,
-                        sample_dataset.get_dataset_id2name(),
-                        sample_dataloader,
-                        logger,
-                    )
-                    logger.info(sample_loss_for_log)
-                    accelerator.log(sample_loss_for_log, step=global_step)
+                    if is_csgo:
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            complete_csgo_validation(global_step, save_path)
+                        accelerator.wait_for_everyone()
+                    else:
+                        sample_loss_for_log = log_sample_res(
+                            text_encoder,
+                            vision_encoder,
+                            rdt,    # We do not use EMA currently
+                            args,
+                            accelerator,
+                            weight_dtype,
+                            sample_dataset.get_dataset_id2name(),
+                            sample_dataloader,
+                            logger,
+                        )
+                        logger.info(sample_loss_for_log)
+                        accelerator.log(sample_loss_for_log, step=global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             logs.update(loss_for_log)
             # logger.info(logs)
             accelerator.log(logs, step=global_step)
+            if is_csgo and accelerator.is_main_process:
+                csgo_hooks.append_loss_jsonl(
+                    csgo_loss_path,
+                    step=global_step,
+                    loss=logs["loss"],
+                    lr=logs["lr"],
+                )
 
             if global_step >= args.max_train_steps:
                 break
@@ -483,9 +754,24 @@ def train(args, logger):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
-        ema_save_path = os.path.join(args.output_dir, f"ema")
-        accelerator.save_model(ema_rdt, ema_save_path)
+        if not is_csgo:
+            accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
+        if ema_rdt is not None:
+            ema_save_path = os.path.join(args.output_dir, f"ema")
+            accelerator.save_model(ema_rdt, ema_save_path)
+
+        if is_csgo:
+            csgo_hooks.plot_loss_curve(
+                csgo_loss_path,
+                os.path.join(csgo_output_dir, "loss_curve.svg"),
+            )
+            if csgo_metadata is None:
+                raise RuntimeError("CSGO metadata was not initialized before training")
+            csgo_metadata["status"] = "complete"
+            csgo_hooks.write_run_metadata(
+                os.path.join(csgo_output_dir, "training_metadata.json"),
+                csgo_metadata,
+            )
         
         logger.info(f"Saved Model to {args.output_dir}")
 

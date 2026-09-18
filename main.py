@@ -282,6 +282,56 @@ def parse_args(input_args=None):
         help="Whether to load the pretrain dataset or finetune dataset."
     )
 
+    # CSGO Benchmark v2 is opt-in.  These arguments are ignored by the
+    # historical RDT dataset path and are consumed by train.train when a
+    # manifest-driven Seen-10 root is supplied.
+    parser.add_argument(
+        "--csgo_data_root",
+        type=str,
+        default=None,
+        help="Read-only CSGO Benchmark v2 root; enables Seen-10 localization.",
+    )
+    parser.add_argument(
+        "--csgo_language_embeddings",
+        type=str,
+        default=None,
+        help="Optional directory/file of per-map precomputed language embeddings.",
+    )
+    parser.add_argument(
+        "--csgo_train_limit_per_map",
+        type=int,
+        default=None,
+        help="Optional prefix limit per map for CSGO training/smoke runs.",
+    )
+    parser.add_argument(
+        "--csgo_eval_limit_per_map",
+        type=int,
+        default=None,
+        help="Optional prefix limit per map for CSGO validation/smoke runs.",
+    )
+    parser.add_argument(
+        "--csgo_smoke",
+        action="store_true",
+        help="Use the five-step CSGO smoke contract when max_train_steps is omitted.",
+    )
+    parser.add_argument(
+        "--csgo_visualization_seed",
+        type=int,
+        default=0,
+        help="Fixed seed for CSGO validation panel selection and diffusion sampling.",
+    )
+    parser.add_argument(
+        "--csgo_output_dir",
+        type=str,
+        default=None,
+        help="CSGO metrics/log/artifact directory; output_dir remains checkpoint root.",
+    )
+    parser.add_argument(
+        "--csgo_cpu",
+        action="store_true",
+        help="Run CSGO components on CPU for tiny smoke checks.",
+    )
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
