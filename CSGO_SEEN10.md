@@ -1,6 +1,6 @@
 # RDT 接入 CSGO Benchmark v2 Seen-10
 
-本文是 RDT 的 Seen-10 定位任务运行说明。命令从项目根目录 `/home/jiahao/task/RoboticsDiffusionTransformer` 执行。实验设计、实现细节和验收证据见 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)；本文记录使用者需要的环境、命令、输出和当前结果。正式训练、全量推理及评测均由使用者手动启动。
+本文是 RDT 的 Seen-10 定位任务运行说明。命令从当前服务器的 RDT 项目根目录执行。实验设计、实现细节和验收证据见 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)；本文记录使用者需要的环境、命令、输出和当前结果。正式训练、全量推理及评测均由使用者手动启动。
 
 legacy 与 aligned 的运行说明统一维护于本文；aligned 的验收记录统一维护于 PLAN 第 9 节，不再保留独立的 aligned 文档。
 
@@ -23,13 +23,62 @@ aligned 与 UniLIP `exp32_loc` 对齐官方 split、5D 目标、样本暴露量�
 
 ## 2. 环境与权重
 
-项目使用 `.venv`。新环境可按下列命令准备；脚本会在需要时克隆本机环境并安装缺失依赖，资产脚本将官方 RDT、SigLIP 和 T5 缓存在 `.cache/csgo_seen10/models/`，支持中断后继续下载。
+项目使用项目内的 `.venv`，不要求安装 ControlAR，也不要求存在 `/home/jiahao`。准备脚本保留已有环境，缺少环境时可独立创建；资产脚本将官方 RDT、SigLIP 和 T5 缓存在当前项目的 `.cache/csgo_seen10/models/`，支持中断后继续下载。下面的 `cd` 按实际 clone 位置调整：
 
 ```bash
-cd /home/jiahao/task/RoboticsDiffusionTransformer
+cd ~/task/RoboticsDiffusionTransformer
 bash scripts/setup_csgo_seen10.sh
 .venv/bin/python scripts/prepare_csgo_assets.py
 ```
+
+环境脚本优先复用已有 `.venv`；新建时使用 Python 3.11 的 venv，若本机没有 Python 3.11 则通过 conda 创建。可用 `RDT_SETUP_PYTHON` 指定 Python 3.11，或显式设置 `RDT_CLONE_SOURCE` 克隆已有 conda 环境。已存在的环境不会因克隆源缺失而失败。
+
+新环境的 PyTorch/torchvision 按 `nvidia-smi` 报告的 CUDA 版本选择成对的 wheel；可用 `RDT_TORCH_BACKEND` 指定后端，具体选项见 `--help`。没有可见 GPU/驱动时自动选择 CPU；在不显示 GPU 的登录节点上准备训练环境，应显式指定计算节点支持的 CUDA 后端。`RDT_TORCH_INDEX_URL` 可指定对应 wheel 源，其他 Python 依赖使用 pip 自身的源配置。
+
+另一台服务器已确认是 A100、驱动 580.125.09、`nvidia-smi` 显示 CUDA 13.0；新建环境可明确使用下面的 cu128 配置。它安装 PyTorch 2.8.0 / torchvision 0.23.0 的 CUDA 12.8 wheel，CUDA 13.0 的显示值不是必须安装的 wheel 版本。配对依据 [PyTorch 官方版本表](https://pytorch.org/get-started/previous-versions/)，驱动向后兼容依据 [NVIDIA 兼容性说明](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)。
+
+```bash
+RDT_TORCH_BACKEND=cu128 bash scripts/setup_csgo_seen10.sh
+```
+
+```bash
+bash scripts/setup_csgo_seen10.sh --dry-run  # 只显示准备方案
+bash scripts/setup_csgo_seen10.sh --check    # 检查已有环境，不安装或升级包
+```
+
+全新环境使用 [requirements_csgo.txt](requirements_csgo.txt) 中的兼容版本，包括 NumPy 1.26.4；原生 `imgaug` 不兼容 NumPy 2.x。已有环境保留已安装版本并检查实际导入，发现冲突时报告错误。定位流程不要求安装 DeepSpeed、TensorFlow 或生成评测依赖。准备脚本不下载模型；上面的资产准备命令才会下载或校验官方权重。
+
+当前服务器已有 PyTorch nightly 环境会保留，新服务器默认采用上述稳定版，因此不承诺两台机器的浮点结果逐位一致；实验报告应保留各自 `--check` 输出及推理 provenance 中的依赖版本。
+
+### 两台服务器的路径配置
+
+推荐在两台服务器均使用同级目录布局：
+
+```text
+task/
+  RoboticsDiffusionTransformer/
+  UniLIP/data/csgo_benchmark_v2/
+  csgo_benchmark_v2_eval_general/run_eval.py
+```
+
+解析顺序为显式 CLI → 环境变量 → YAML。原 YAML 中本机的默认路径仍存在时沿用；若这些旧默认路径在另一台服务器不存在，自动使用上述同级目录，评测 Python 回退到 RDT `.venv/bin/python`。自定义的错误路径不会被静默替换。共享定位评测不要求单独安装名为 UniLIP 的环境。
+
+若实际布局不同，在当前 shell 设置以下变量；训练、推理及 wrapper 评测会使用相同数据路径：
+
+```bash
+export CSGO_DATA_ROOT=/actual/path/to/csgo_benchmark_v2
+export SHARED_EVAL_DIR=/actual/path/to/csgo_benchmark_v2_eval_general
+export UNILIP_PYTHON="$PWD/.venv/bin/python"
+```
+
+也可使用 `--data-root`、`--eval-root`、`--unilip-python` 显式覆盖。旧别名 `DATA_ROOT`、`CSGO_EVAL_ROOT` 仍支持；不要同时设置相互冲突的别名。只查看实际解析结果、不执行训练或评测：
+
+```bash
+bash scripts/run_csgo_seen10.sh train \
+  --config configs/csgo_seen10_aligned.yaml --print-paths
+```
+
+Git 不同步 `.venv`、权重缓存、benchmark 数据或共享评测器；另一台服务器需要单独准备这些内容。若复制已有权重缓存，仍需在目标服务器运行资产准备脚本以校验文件并刷新 manifest 中的本地路径。此变更支持在另一台服务器新建同配方实验，不放宽旧 checkpoint 的跨路径恢复一致性检查。
 
 本机上述三组官方资产已缓存。aligned 从原始 `rdt-1b` 初始化，不从已有 CSGO checkpoint 热启动。`--dry-run` 只检查并打印解析后的参数，不构建模型，也不创建训练输出：
 
@@ -89,10 +138,10 @@ bash scripts/run_csgo_seen10.sh eval --seed 1
 legacy 默认推理取 validation `best`，默认 batch 来自配置的 `training.eval_batch_size=4`。`scripts/run_csgo_seen10.sh` 的模式专用参数可放在 `--` 后，例如 `infer --seed 1 -- --batch-size 4`。已有预测按样本 identity 续写，`inference_provenance.json` 会核对 checkpoint 与 seed。若仅重新评测现有 seed 0 的 20,000 条预测，应直接调用共享评测器并选择未使用的输出目录：
 
 ```bash
-/home/jiahao/miniconda3/envs/UniLIP/bin/python \
-  /home/jiahao/task/csgo_benchmark_v2_eval_general/run_eval.py localization \
+"${UNILIP_PYTHON:-.venv/bin/python}" \
+  "${SHARED_EVAL_DIR:-../csgo_benchmark_v2_eval_general}/run_eval.py" localization \
   --pred-root outputs/csgo_benchmark_v2_seen10/RDT/seed_0/localization \
-  --data-root /home/jiahao/task/UniLIP/data/csgo_benchmark_v2 \
+  --data-root "${CSGO_DATA_ROOT:-../UniLIP/data/csgo_benchmark_v2}" \
   --pose-space normalized \
   --output outputs/csgo_benchmark_v2_seen10/RDT/seed_0/evaluation/localization_recheck
 ```
@@ -123,7 +172,7 @@ RDT 使用共享评测器的无 epsilon Z 归一化，UniLIP `exp32_loc`/`exp32`
 .venv/bin/python scripts/export_unilip_seen_predictions.py \
   --input /path/to/unilip_predictions.jsonl \
   --output outputs/unilip_exp32_loc_export/localization/predictions.jsonl \
-  --calibration /home/jiahao/task/UniLIP/data/csgo_benchmark_v2/calibration/z_calibration.json \
+  --calibration "${CSGO_DATA_ROOT:-../UniLIP/data/csgo_benchmark_v2}/calibration/z_calibration.json" \
   --source-z-epsilon 1e-6
 ```
 

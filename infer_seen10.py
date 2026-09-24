@@ -23,6 +23,7 @@ from models.csgo_rdt import CSGORDTRunner
 from models.multimodal_encoder.siglip_encoder import SiglipVisionTower
 from train.csgo_hooks import prepare_csgo_batch
 from train.csgo_visualize import render_localization
+from scripts.csgo_paths import data_root as resolve_data_root
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -100,7 +101,7 @@ def _run_paths(config: Mapping[str, Any], config_path: Path, cli: argparse.Names
             checkpoint_dir = checkpoint_dir.parent / "smoke" / checkpoint_dir.name
     else:
         checkpoint_dir = _path(cli.checkpoint, project_root)
-    data_root = _path(cli.data_root if cli.data_root is not None else config["data_root"], project_root)
+    data_root = resolve_data_root(config, cli.data_root, root=project_root)
     return data_root, output_dir, checkpoint_dir
 
 

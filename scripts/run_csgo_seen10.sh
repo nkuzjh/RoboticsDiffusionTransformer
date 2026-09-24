@@ -3,8 +3,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
-UNILIP_PYTHON="${UNILIP_PYTHON:-/home/jiahao/miniconda3/envs/UniLIP/bin/python}"
-EVAL_ROOT="${SHARED_EVAL_DIR:-${CSGO_EVAL_ROOT:-/home/jiahao/task/csgo_benchmark_v2_eval_general}}"
+UNILIP_PYTHON="${UNILIP_PYTHON:-}"
+EVAL_ROOT="${SHARED_EVAL_DIR:-${CSGO_EVAL_ROOT:-}}"
 DATA_ROOT="${DATA_ROOT:-${CSGO_DATA_ROOT:-}}"
 CONFIG="$PROJECT_ROOT/configs/csgo_seen10.yaml"
 CONFIG_EXPLICIT=0
@@ -14,6 +14,7 @@ OUTPUT_DIR=""
 CHECKPOINT_DIR=""
 NATIVE_EXTRA=()
 CPU=0
+PRINT_PATHS=0
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,8 @@ Options:
   --checkpoint-dir PATH    Complete native checkpoint directory for this seed
   --python PATH            Project Python interpreter
   --unilip-python PATH     Shared evaluator Python interpreter
+  --eval-root PATH         Shared evaluator checkout (containing run_eval.py)
+  --print-paths            Print resolved paths only; do not run any task
   --cpu                    Run model training/inference on CPU
   --                       Forward remaining arguments to train_seen10.py for train/smoke,
                            or infer_seen10.py for infer
@@ -71,6 +74,14 @@ while (($# > 0)); do
       UNILIP_PYTHON="$2"
       shift 2
       ;;
+    --eval-root)
+      EVAL_ROOT="$2"
+      shift 2
+      ;;
+    --print-paths)
+      PRINT_PATHS=1
+      shift
+      ;;
     --cpu)
       CPU=1
       shift
@@ -98,13 +109,18 @@ if [[ "$MODE" == "smoke" && "$CONFIG_EXPLICIT" == 0 && -f "$PROJECT_ROOT/.cache/
 fi
 
 cd "$PROJECT_ROOT"
+if [[ ! -x "$PYTHON" ]]; then
+  echo "run_csgo_seen10: Python unavailable: $PYTHON; run bash scripts/setup_csgo_seen10.sh first" >&2
+  exit 2
+fi
 
 # Resolve defaults from the chosen profile; never replace aligned paths with
 # legacy seed_0 defaults. Explicit CLI/environment paths still win.
-resolved="$("$PYTHON" - "$CONFIG" "$SEED" "$MODE" <<'PY'
+resolved="$("$PYTHON" - "$CONFIG" "$SEED" "$MODE" "$DATA_ROOT" "$EVAL_ROOT" "$UNILIP_PYTHON" "$PYTHON" <<'PY'
 import sys
 from pathlib import Path
 import yaml
+from scripts.csgo_paths import data_root, evaluator_root, evaluator_python
 c = yaml.safe_load(Path(sys.argv[1]).read_text())
 seed = int(sys.argv[2]) if sys.argv[2] else int(c.get('seed', 0))
 parts = [str(c.get('model_name', 'RDT'))]
@@ -112,16 +128,36 @@ if sys.argv[3] == 'smoke':
     parts.append('smoke')
 parts.append(f'seed_{seed}')
 print(seed)
-print(c['data_root'])
+print(data_root(c, sys.argv[4] or None))
 print(Path(c.get('output_root', 'outputs/csgo_benchmark_v2_seen10')).joinpath(*parts))
 print(Path(c.get('checkpoint_root', 'checkpoints/csgo_benchmark_v2_seen10')).joinpath(*parts))
+print(evaluator_root(c, sys.argv[5] or None))
+print(evaluator_python(c, sys.argv[6] or None, python=sys.argv[7]))
 PY
 )"
 mapfile -t profile_paths <<< "$resolved"
 SEED="${profile_paths[0]}"
-DATA_ROOT="${DATA_ROOT:-${profile_paths[1]}}"
+DATA_ROOT="${profile_paths[1]}"
 OUTPUT_DIR="${OUTPUT_DIR:-${profile_paths[2]}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${profile_paths[3]}}"
+EVAL_ROOT="${profile_paths[4]}"
+UNILIP_PYTHON="${profile_paths[5]}"
+
+if ((PRINT_PATHS)); then
+  "$PYTHON" - "$CONFIG" "$SEED" "$DATA_ROOT" "$OUTPUT_DIR" "$CHECKPOINT_DIR" "$EVAL_ROOT" "$UNILIP_PYTHON" <<'PY'
+import json, sys
+print(json.dumps(dict(zip(("config", "seed", "data_root", "output_dir", "checkpoint_dir", "shared_eval_dir", "unilip_python"), sys.argv[1:])), indent=2))
+PY
+  exit 0
+fi
+
+if [[ "$MODE" == "eval" || "$MODE" == "smoke" ]]; then
+  if [[ ! -f "$EVAL_ROOT/run_eval.py" || ! -x "$UNILIP_PYTHON" ]]; then
+    echo "run_csgo_seen10: evaluator or interpreter unavailable: $EVAL_ROOT/run_eval.py; $UNILIP_PYTHON" >&2
+    echo "Set --eval-root (or SHARED_EVAL_DIR) and --unilip-python (or UNILIP_PYTHON)." >&2
+    exit 2
+  fi
+fi
 
 cpu_args=()
 if ((CPU)); then

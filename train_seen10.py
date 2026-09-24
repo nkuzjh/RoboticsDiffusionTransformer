@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from scripts.csgo_paths import data_root as resolve_data_root
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "csgo_seen10.yaml"
@@ -75,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _resolved_paths(config: dict[str, Any], config_path: Path, cli: argparse.Namespace) -> tuple[Path, Path, Path]:
     project_root = PROJECT_ROOT
-    data_root = _path(cli.data_root if cli.data_root is not None else config["data_root"], project_root)
+    data_root = resolve_data_root(config, cli.data_root, root=project_root)
     output_root = config.get("output_root", "outputs/csgo_benchmark_v2_seen10")
     checkpoint_root = config.get("checkpoint_root", "checkpoints/csgo_benchmark_v2_seen10")
     model_name = str(config.get("model_name", "RDT"))

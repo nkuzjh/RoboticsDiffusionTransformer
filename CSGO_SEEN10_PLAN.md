@@ -6,7 +6,7 @@
 
 当前 aligned profile 为 `aligned_native_aug_v1`，已经实现并完成隔离验收，尚未正式训练。
 legacy 已有正式训练和完整测试结果；“本轮未启动正式实验”不等于“项目从未运行过正式实验”。
-本次文档整理不改变代码、配置或实验策略。
+此前文档整理没有改变代码、配置或实验策略；后续跨服务器准备脚本变更及其验收见第 9.5 节。
 
 ## 1. 范围、比较对象与设计依据
 
@@ -189,10 +189,13 @@ smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 | train_seen10.py | CLI/YAML解析、原始参数记录、预算/节点校验、dry-run与smoke边界 |
 | infer_seen10.py | aligned默认late、seed42/batch1/单进程、求解器provenance、标准预测和coverage |
 | scripts/run_csgo_seen10.sh | 所选YAML决定默认seed/输出目录；eval调用共享原evaluator |
+| scripts/csgo_paths.py | 跨服务器数据/评测路径解析；CLI、环境变量覆盖及旧默认路径的迁移回退，不改写实验 YAML |
+| scripts/setup_csgo_seen10.sh | 创建或复用项目环境，检查依赖；不要求另一项目的环境存在 |
 | train/csgo_visualize.py | 固定种子按地图取样；GT只供后处理 |
 | scripts/export_unilip_seen_predictions.py | Z epsilon及预测格式转换，不修改evaluator |
 
-显式CLI路径/seed等覆盖YAML默认；YAML training映射为native参数后，透传参数最后解析。
+数据/评测路径按显式CLI、环境变量、YAML的顺序解析；原机器默认路径不可用时回退到同级数据/评测目录和项目 Python，自定义路径不自动替换。训练与推理复用同一解析器。此变更不修改已保存协议中的 YAML，也不放宽跨服务器恢复校验。
+显式CLI seed等覆盖YAML默认；YAML training映射为native参数后，透传参数最后解析。
 aligned随后校验最终运行值，违反固定协议的覆盖报错，不能只凭YAML认定实际值。
 审计记录raw_config、原始CLI/native argv、resolved_args、optimizer实际组和checkpoint状态。
 contract包含manifest、完整YAML、语言缓存等哈希；不宣称已复制X-VLA的“30个split文件统一data-contract SHA256”实现。
@@ -314,4 +317,15 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - 官方1B GPU前后向、峰值显存、吞吐、正式推理延迟和收敛尚未实测，不从smoke指标推断性能。
 - UniLIP完整原始资产哈希、逐样本轨迹及部分验证/推理细节仍未确认；不把配置/注释/相邻实验当作运行证据。
 - legacy历史provenance未保存实际推理batch/进程数；已有正式结果与当前默认重跑不保证逐位一致。
-- 本次文档整理不运行训练、推理、评测或测试；不会自动启动正式任务。此前aligned验收也未安装依赖、下载权重或修改外部UniLIP/数据/evaluator。
+- 此前文档整理没有运行训练、推理、评测或测试。此前aligned验收也未安装依赖、下载权重或修改外部UniLIP/数据/evaluator。
+
+### 9.5 跨服务器环境准备变更与验收
+
+准备脚本取消对原机器 ControlAR 环境的强制依赖，支持新建 Python 3.11 环境、显式克隆、复用已有环境和首次安装中断后重试。新环境安装完整兼容依赖；已有环境补依赖时约束已安装版本，避免静默替换训练环境。`--check` 只读导入验证，`--dry-run` 只显示准备方案。
+
+已知目标服务器为 A100、驱动 580.125.09、CUDA 13.0 报告值；新环境选择 PyTorch 2.8.0 / torchvision 0.23.0 cu128。本机现有 nightly 环境保留。benchmark/evaluator 路径通过共享解析器迁移，实验 YAML、有效 batch、update、增强及五个 checkpoint 保存节点没有变更。
+
+- 原有 aligned 22 项检查及新增路径 5 项检查通过；新增环境脚本 7 项模拟检查通过，共 34 项。覆盖原路径保留、新服务器回退、CLI/环境变量优先级、无 ControlAR 环境、新建 conda、CUDA 13.0 选择 cu128、安装中断重试。
+- 本机实际 `setup_csgo_seen10.sh --check` 通过：Python 3.11.14、Torch 2.11.0.dev20260124+cu128、torchvision 0.25.0.dev20260124+cu128、NumPy 1.26.4；训练/推理模块导入成功，CUDA 可用。
+- aligned dry-run、wrapper 路径打印、shell 语法、文档命令语法和 `git diff --check` 通过。
+- 没有执行依赖安装、模型下载、正式训练/推理/评测。新服务器的实际安装与 GPU 运行尚待用户同步后验证；不把模拟安装分支测试当作另一台机器的实测。

@@ -25,12 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if os.fspath(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(PROJECT_ROOT))
 DEFAULT_OUTPUT = PROJECT_ROOT / ".cache" / "csgo_seen10" / "tiny_fixture"
-DEFAULT_DATA_ROOT = Path(
-    os.environ.get("CSGO_DATA_ROOT", "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2")
-)
-DEFAULT_SHARED_EVAL = Path(
-    os.environ.get("SHARED_EVAL_DIR", "/home/jiahao/task/csgo_benchmark_v2_eval_general")
-)
+from scripts.csgo_paths import data_root, evaluator_root, evaluator_python
+
+DEFAULT_DATA_ROOT = data_root({})
+DEFAULT_SHARED_EVAL = evaluator_root({})
 MAPS = (
     "cs_agency",
     "cs_italy",
@@ -176,7 +174,7 @@ def _tiny_config(
         "seed": 0,
         "data_root": os.fspath(data_root.expanduser().resolve()),
         "shared_eval_dir": os.fspath(shared_eval_dir.expanduser().resolve()),
-        "unilip_python": "/home/jiahao/miniconda3/envs/UniLIP/bin/python",
+        "unilip_python": str(evaluator_python({}, python=sys.executable)),
         "pretrained_model_name_or_path": _project_path(rdt),
         "pretrained_text_encoder_name_or_path": _project_path(t5),
         "pretrained_vision_encoder_name_or_path": _project_path(siglip),
