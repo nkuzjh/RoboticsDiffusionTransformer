@@ -170,6 +170,8 @@ logs/
 # Output
 outs/
 outputs/csgo_benchmark_v2_seen10/
+outputs/csgo_aligned_aug_v1/
+outputs/csgo_legacy_reproduction/
 
 # Checkpoints
 checkpoints/

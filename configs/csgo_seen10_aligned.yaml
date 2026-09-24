@@ -1,0 +1,154 @@
+# Approved Seen-10 localization profile. Saves: 4000,8000,12000,16000,19500.
+# No formal run is started automatically. See CSGO_SEEN10.md and CSGO_SEEN10_PLAN.md.
+schema_version: 2
+model_name: RDT
+model_type: VLA
+task: localization
+seed: 42
+data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
+shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
+unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+pretrained_model_name_or_path: .cache/csgo_seen10/models/rdt-1b
+pretrained_text_encoder_name_or_path: .cache/csgo_seen10/models/t5-v1_1-xxl
+pretrained_vision_encoder_name_or_path: .cache/csgo_seen10/models/siglip-so400m-patch14-384
+output_root: outputs/csgo_aligned_aug_v1
+checkpoint_root: checkpoints/csgo_aligned_aug_v1
+common:
+  img_history_size: 1
+  action_chunk_size: 1
+  num_cameras: 2
+  state_dim: 128
+dataset:
+  buf_path: /path/to/buffer
+  buf_num_chunks: 512
+  buf_chunk_size: 512
+  epsd_len_thresh_low: 32
+  epsd_len_thresh_high: 2048
+  image_aspect_ratio: pad
+  tokenizer_max_length: 1024
+model:
+  lang_adaptor: mlp2x_gelu
+  img_adaptor: mlp2x_gelu
+  state_adaptor: mlp3x_gelu
+  lang_token_dim: 4096
+  img_token_dim: 1152
+  state_token_dim: 128
+  rdt:
+    hidden_size: 2048
+    depth: 28
+    num_heads: 32
+    cond_pos_embed_type: multimodal
+  noise_scheduler:
+    type: ddpm
+    num_train_timesteps: 1000
+    num_inference_timesteps: 5
+    beta_schedule: squaredcos_cap_v2
+    prediction_type: sample
+    clip_sample: false
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+csgo:
+  maps:
+  - cs_agency
+  - cs_italy
+  - de_ancient
+  - de_anubis
+  - de_dust2
+  - de_inferno
+  - de_mirage
+  - de_nuke
+  - de_overpass
+  - de_train
+  train_split: seen_train
+  validation_split: seen_validation
+  inference_split: seen_discrete_test
+  horizon: 1
+  num_cameras: 2
+  state_dim: 128
+  action_dim: 128
+  active_action_dim: 5
+  action_order:
+  - x
+  - y
+  - z
+  - pitch
+  - yaw
+  prediction_pose_space: normalized
+  state_is_zero: true
+  state_is_masked: false
+  language_embeddings: null
+  external_action_dim: 5
+  internal_action_dim: 128
+  normalization: benchmark_evaluator_v2
+  z_denominator_epsilon: 0.0
+  state_mode: zero_slot
+  diffusion_channel_policy: native_full
+  augmentation:
+    policy: rdt_native_image_v1
+    train_only: true
+    views:
+    - fpv
+    - radar
+    per_view_probability: 0.5
+    independent_views: true
+    geometry: none
+    auto_adjust_image_brightness: false
+    state_noise_snr: null
+    condition_dropout_probability: 0.0
+    rng_mode: sample_occurrence
+training:
+  max_train_steps: 19500
+  train_batch_size: 4
+  eval_batch_size: 4
+  gradient_accumulation_steps: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  warmup_steps: 59
+  dataloader_num_workers: 0
+  mixed_precision: bf16
+  validation_passes: 5
+  save_passes: 5
+  map_sampling: global_epoch_permutation
+  report_to: none
+  adaptation_mode: role_lora
+  effective_localization_batch_size: 128
+  warmup_updates: 59
+  scheduler: cosine_with_min_lr
+  min_lr: 1.0e-05
+  checkpoint_interval_updates: 4000
+  validation_interval_updates: 4000
+  checkpoint_steps:
+  - 4000
+  - 8000
+  - 12000
+  - 16000
+  - 19500
+  validation_selection_metric: normalized_valid5_mse
+  trainable_parameter_dtype: float32
+  gradient_checkpointing: false
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    bias: none
+visualization:
+  enabled: true
+  samples_per_map: 10
+  seed: 42
+outputs:
+  localization_predictions: localization/predictions.jsonl
+  visualization: localization/visualization
+  loss_curve: loss_curve.svg
+  evaluation: evaluation/localization
+profile: aligned_native_aug_v1
+inference:
+  checkpoint_rule: late
+  seed: 42
+  batch_size: 1
+  num_processes: 1
+  num_inference_timesteps: 5
+  partial_output_policy: reject

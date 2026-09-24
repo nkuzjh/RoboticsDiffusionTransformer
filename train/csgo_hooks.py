@@ -228,6 +228,9 @@ def build_csgo_components(
         dtype=dtype,
         active_action_dim=ACTIVE_ACTION_DIM,
     )
+    csgo_options = _mapping(config.get("csgo"))
+    if csgo_options.get("diffusion_channel_policy") is not None:
+        model_kwargs["diffusion_channel_policy"] = str(csgo_options["diffusion_channel_policy"])
     if model_path:
         logger.info("Loading CSGO RDT weights from %s", model_path)
         rdt = CSGORDTRunner.from_pretrained(model_path, **model_kwargs)
@@ -287,7 +290,10 @@ def build_csgo_components(
 
     # The encoders are inference-only.  Their parameters are deliberately not
     # passed to Accelerator.prepare, preserving native RDT optimizer state.
+    vision_encoder.vision_tower.requires_grad_(False)
     vision_encoder.vision_tower.to(accelerator.device, dtype=dtype).eval()
+    if text_encoder is not None:
+        text_encoder.requires_grad_(False)
     return {
         "config": native_config,
         "rdt": rdt,
@@ -355,6 +361,7 @@ def prepare_csgo_batch(
     accelerator: Accelerator,
     dtype: torch.dtype,
     training: bool = True,
+    aligned: bool = False,
 ) -> dict[str, Any]:
     """Turn a Seen-10 collated batch into native CSGO RDT tensors."""
 
@@ -380,7 +387,14 @@ def prepare_csgo_batch(
     if training:
         if "actions" not in batch:
             raise KeyError("Training CSGO batch is missing actions")
-        result["action_gt"] = _move_tensor(batch["actions"], device=device, dtype=dtype)
+        action = _move_tensor(batch["actions"], device=device, dtype=dtype)
+        if aligned:
+            if action.ndim != 3 or action.shape[1:] != (1, ACTIVE_ACTION_DIM):
+                raise ValueError(f"Aligned CSGO requires external action (B,1,5), got {tuple(action.shape)}")
+            padded = torch.zeros((images.shape[0], 1, ACTION_DIM), device=device, dtype=dtype)
+            padded[..., :ACTIVE_ACTION_DIM] = action
+            action = padded
+        result["action_gt"] = action
         # The dataset may expose a 128-D mask, but the CSGO objective always
         # owns the first five dimensions and never trusts a robot state mask.
         mask = torch.zeros((images.shape[0], 1, ACTION_DIM), device=device, dtype=dtype)

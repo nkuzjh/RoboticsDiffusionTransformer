@@ -1,9 +1,9 @@
 """RDT adapter for the CSGO Benchmark v2 localization task.
 
 The benchmark uses the native 128 dimensional RDT action representation so a
-checkpoint can retain its original action head.  Only the first five entries
-are active (``x, y, z, pitch, yaw``); the remaining entries are zeroed before
-the diffusion process and are masked from the loss and sampler at every step.
+checkpoint can retain its original action head.  The legacy path masks the
+unused channels during diffusion.  The aligned path keeps all 128 channels in
+the diffusion process and masks only the final predicted action.
 
 ``CSGORDTRunner`` intentionally keeps the public call signature of
 ``RDTRunner``.  This lets the normal RDT training loop call the adapter without
@@ -183,6 +183,8 @@ class CSGORDTRunner(RDTRunner):
         dtype: torch.dtype = torch.bfloat16,
         active_action_dim: int = DEFAULT_ACTIVE_ACTION_DIM,
         mask_invalid_action_dims: bool = True,
+        diffusion_channel_policy: str = "legacy_valid5",
+        role_adaptation: Mapping[str, Any] | None = None,
         csgo_img_history_size: int = DEFAULT_TARGET_HISTORY,
         csgo_num_cameras: int = DEFAULT_TARGET_CAMERAS,
         **extra_config: Any,
@@ -195,8 +197,16 @@ class CSGORDTRunner(RDTRunner):
             raise ValueError(f"active_action_dim must be in [1, {action_dim}], got {active_action_dim}")
         if int(csgo_img_history_size) != 1 or int(csgo_num_cameras) != 2:
             raise ValueError("CSGO expects one current history and exactly FPV+radar (two cameras)")
+        if diffusion_channel_policy not in ("legacy_valid5", "native_full"):
+            raise ValueError(f"Unsupported diffusion_channel_policy: {diffusion_channel_policy}")
 
         normalized_config = _model_config(config, extra_config)
+        if diffusion_channel_policy == "native_full":
+            if int(active_action_dim) != DEFAULT_ACTIVE_ACTION_DIM:
+                raise ValueError("Aligned CSGO requires five external pose dimensions")
+            scheduler = _as_plain_dict(normalized_config.get("noise_scheduler"))
+            if scheduler.get("prediction_type") != "sample" or scheduler.get("clip_sample") is not False:
+                raise ValueError("Aligned CSGO requires clean-action prediction and clip_sample=False")
         # Explicit constructor arguments win over the nested model config.
         lang_token_dim = int(
             extra_config.get("lang_token_dim", normalized_config.get("lang_token_dim", lang_token_dim))
@@ -207,6 +217,8 @@ class CSGORDTRunner(RDTRunner):
         state_token_dim = int(
             extra_config.get("state_token_dim", normalized_config.get("state_token_dim", state_token_dim))
         )
+        if diffusion_channel_policy == "native_full" and state_token_dim != DEFAULT_STATE_TOKEN_DIM:
+            raise ValueError("Aligned CSGO requires a 128-D zero state slot")
         max_lang_cond_len = int(
             extra_config.get("max_lang_cond_len", normalized_config.get("max_lang_cond_len", max_lang_cond_len))
         )
@@ -252,6 +264,8 @@ class CSGORDTRunner(RDTRunner):
             self.model.freq_embedder.dtype = dtype
         self.active_action_dim = int(active_action_dim)
         self.mask_invalid_action_dims = bool(mask_invalid_action_dims)
+        self.diffusion_channel_policy = diffusion_channel_policy
+        self.role_adaptation = dict(role_adaptation) if role_adaptation else None
         self.state_token_dim = int(state_token_dim)
         self.csgo_img_history_size = int(csgo_img_history_size)
         self.csgo_num_cameras = int(csgo_num_cameras)
@@ -288,6 +302,8 @@ class CSGORDTRunner(RDTRunner):
             "img_pos_embed_config": img_pos_embed_config,
             "active_action_dim": self.active_action_dim,
             "mask_invalid_action_dims": self.mask_invalid_action_dims,
+            "diffusion_channel_policy": self.diffusion_channel_policy,
+            "role_adaptation": self.role_adaptation,
             "csgo_img_history_size": self.csgo_img_history_size,
             "csgo_num_cameras": self.csgo_num_cameras,
         }
@@ -359,6 +375,14 @@ class CSGORDTRunner(RDTRunner):
             raise ValueError(f"state_tokens width must be 128, got {state.shape[-1]}")
         return state
 
+    def _validate_native_conditions(self, state: torch.Tensor, mask: torch.Tensor, ctrl_freqs: torch.Tensor) -> None:
+        if torch.any(state != 0):
+            raise ValueError("Aligned CSGO requires the all-zero state slot")
+        if torch.any(mask[..., : self.active_action_dim] != 1):
+            raise ValueError("Aligned CSGO requires all five pose action indicators")
+        if torch.any(ctrl_freqs != 1):
+            raise ValueError("Aligned CSGO requires control frequency one")
+
     def adapt_conditions(self, lang_tokens, img_tokens, state_tokens):
         # The parent adapters are dtype-sensitive under bf16.  Casting here
         # also makes lightweight CPU smoke models accept ordinary float32
@@ -379,7 +403,13 @@ class CSGORDTRunner(RDTRunner):
         action_mask,
         ctrl_freqs,
     ) -> torch.Tensor:
-        """Train diffusion with zero noise and zero loss contribution off 5D."""
+        """Train the selected diffusion channel policy."""
+
+        if self.diffusion_channel_policy == "native_full":
+            return self._compute_native_full_loss(
+                lang_tokens, lang_attn_mask, img_tokens, state_tokens,
+                action_gt, action_mask, ctrl_freqs,
+            )
 
         if not self.mask_invalid_action_dims:
             return super().compute_loss(
@@ -423,8 +453,62 @@ class CSGORDTRunner(RDTRunner):
         error = (pred - target).pow(2) * action_mask_expanded
         return error.sum() / action_mask_expanded.sum().clamp_min(1.0)
 
+    def _compute_native_full_loss(
+        self, lang_tokens, lang_attn_mask, img_tokens, state_tokens,
+        action_gt, action_mask, ctrl_freqs,
+    ) -> torch.Tensor:
+        """Original RDT full-width noising and MSE with a CSGO state slot."""
+
+        import torch.nn.functional as F
+
+        batch_size = lang_tokens.shape[0]
+        device = lang_tokens.device
+        dtype = self.parameter_dtype
+        state = self._state_tokens(state_tokens, batch_size, device, dtype)
+        action = self._full_action(action_gt, batch_size, device, dtype)
+        mask = self._full_action_mask(action_mask, batch_size, device, dtype)
+        if torch.any(action[..., self.active_action_dim:] != 0):
+            raise ValueError("The padded CSGO target channels must be zero")
+        noise = torch.randn_like(action)
+        timesteps = torch.randint(0, self.num_train_timesteps, (batch_size,), device=device).long()
+        noisy_action = self.noise_scheduler.add_noise(action, noise, timesteps)
+        state_action = torch.cat([state, noisy_action], dim=1)
+        indicators = torch.cat([torch.zeros_like(state), mask.expand(-1, self.pred_horizon, -1)], dim=1)
+        state_action = torch.cat([state_action, indicators], dim=2)
+        ctrl_freqs = torch.as_tensor(ctrl_freqs, device=device, dtype=dtype).reshape(-1)
+        self._validate_native_conditions(state, mask, ctrl_freqs)
+        with self._role_autocast():
+            lang_cond, img_cond, state_action = self.adapt_conditions(lang_tokens, img_tokens, state_action)
+            pred = self.model(
+                state_action, ctrl_freqs, timesteps, lang_cond, img_cond,
+                lang_mask=lang_attn_mask,
+            )
+        if self.prediction_type == "epsilon":
+            target = noise
+        elif self.prediction_type == "sample":
+            target = action
+        else:
+            raise ValueError(f"Unsupported prediction type {self.prediction_type}")
+        return F.mse_loss(pred.float(), target.float())
+
+    def _role_autocast(self):
+        """Allow FP32 trainable LoRA/adaptors beside frozen BF16 base weights."""
+
+        from contextlib import nullcontext
+
+        if self.role_adaptation and self.parameter_dtype in (torch.bfloat16, torch.float16):
+            device_type = self.model.x_pos_embed.device.type
+            if device_type in ("cuda", "cpu") and not (device_type == "cpu" and self.parameter_dtype == torch.float16):
+                return torch.autocast(device_type=device_type, dtype=self.parameter_dtype)
+        return nullcontext()
+
     def conditional_sample(self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs):
-        """Sample while projecting inactive native dimensions to zero each step."""
+        """Sample with the selected diffusion channel policy."""
+
+        if self.diffusion_channel_policy == "native_full":
+            return self._conditional_sample_native_full(
+                lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs,
+            )
 
         device = state_traj.device
         dtype = state_traj.dtype
@@ -455,6 +539,36 @@ class CSGORDTRunner(RDTRunner):
             noisy_action = noisy_action.to(dtype=dtype) * action_mask_expanded
         return noisy_action * mask.expand(-1, self.pred_horizon, -1)
 
+    def _conditional_sample_native_full(
+        self, lang_cond, lang_attn_mask, img_cond, state_traj, action_mask, ctrl_freqs,
+    ):
+        """Keep the complete noisy latent until the original final action mask."""
+
+        device = state_traj.device
+        dtype = state_traj.dtype
+        batch_size = state_traj.shape[0]
+        mask = self._full_action_mask(action_mask, batch_size, device, dtype)
+        mask = mask.expand(-1, self.pred_horizon, -1)
+        noisy_action = torch.randn(
+            (batch_size, self.pred_horizon, self.action_dim), device=device, dtype=dtype,
+        )
+        self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
+        ctrl_freqs = torch.as_tensor(ctrl_freqs, device=device, dtype=dtype).reshape(-1)
+        if torch.any(ctrl_freqs != 1):
+            raise ValueError("Aligned CSGO requires control frequency one")
+        with self._role_autocast():
+            for timestep in self.noise_scheduler_sample.timesteps:
+                action_traj = self.state_adaptor(torch.cat([noisy_action, mask], dim=2))
+                full_traj = torch.cat([state_traj, action_traj], dim=1)
+                model_output = self.model(
+                    full_traj, ctrl_freqs, timestep.unsqueeze(-1).to(device),
+                    lang_cond, img_cond, lang_mask=lang_attn_mask,
+                )
+                noisy_action = self.noise_scheduler_sample.step(
+                    model_output, timestep, noisy_action,
+                ).prev_sample.to(dtype=dtype)
+        return noisy_action * mask
+
     def predict_action(
         self,
         lang_tokens,
@@ -469,11 +583,19 @@ class CSGORDTRunner(RDTRunner):
         dtype = self.parameter_dtype
         state = self._state_tokens(state_tokens, batch_size, device, dtype)
         mask = self._full_action_mask(action_mask, batch_size, device, dtype)
+        if self.diffusion_channel_policy == "native_full":
+            self._validate_native_conditions(
+                state, mask, torch.as_tensor(ctrl_freqs, device=device, dtype=dtype).reshape(-1),
+            )
         # CSGO has no proprioception.  Its state value and indicator are both
         # zero; the active mask belongs to action tokens only.
         state_with_mask = torch.cat([state, torch.zeros_like(state)], dim=2)
-        lang_cond, img_cond, state_traj = self.adapt_conditions(lang_tokens, img_tokens, state_with_mask)
-        return self.conditional_sample(lang_cond, lang_attn_mask, img_cond, state_traj, mask, ctrl_freqs)
+        with self._role_autocast():
+            lang_cond, img_cond, state_traj = self.adapt_conditions(lang_tokens, img_tokens, state_with_mask)
+        sample = self.conditional_sample(lang_cond, lang_attn_mask, img_cond, state_traj, mask, ctrl_freqs)
+        if self.diffusion_channel_policy == "native_full":
+            return sample[..., : self.active_action_dim]
+        return sample
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         return self.compute_loss(*args, **kwargs)
@@ -581,7 +703,7 @@ class CSGORDTRunner(RDTRunner):
             value = source_value(name)
             if value is not None:
                 kwargs[name] = int(value)
-        for name in ("active_action_dim", "mask_invalid_action_dims", "csgo_img_history_size", "csgo_num_cameras"):
+        for name in ("active_action_dim", "mask_invalid_action_dims", "diffusion_channel_policy", "role_adaptation", "csgo_img_history_size", "csgo_num_cameras"):
             value = source_value(name)
             if value is not None:
                 kwargs[name] = value
@@ -602,6 +724,10 @@ class CSGORDTRunner(RDTRunner):
             raise FileNotFoundError(f"No model weights found at {model_id}")
 
         model = cls(config=target_config, **kwargs)
+        if model.role_adaptation:
+            from models.csgo_adaptation import build_role_adaptation
+
+            build_role_adaptation(model, model.role_adaptation)
         source_state = _load_state_file(source_file, "cpu")
         model._load_adapted_state_dict(source_state, source_config, strict=strict)
         model.eval()

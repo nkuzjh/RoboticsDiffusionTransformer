@@ -83,6 +83,11 @@ def train(args, logger):
     with open(args.config_path, "r") as fp:
         config = yaml.safe_load(fp)
 
+    if isinstance(config, Mapping) and config.get("profile") == "aligned_native_aug_v1":
+        from train.csgo_aligned import train_aligned
+
+        return train_aligned(args, config, logger)
+
     # CSGO is an explicit opt-in.  The native path below remains unchanged for
     # all existing RDT datasets; only its construction/data/eval calls branch
     # when a benchmark root (or a YAML ``csgo`` mapping) is present.

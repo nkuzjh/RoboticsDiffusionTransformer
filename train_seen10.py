@@ -11,6 +11,7 @@ loop in the benchmark project.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visualization-seed", type=int, default=None)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--cpu", action="store_true", help="Run the native adapter on CPU")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and print the resolved invocation without constructing models or writing outputs")
     return parser
 
 
@@ -161,7 +163,7 @@ def _native_argv(
         "--adam_weight_decay",
         str(float(training.get("weight_decay", 1e-2))),
         "--lr_warmup_steps",
-        str(int(training.get("warmup_steps", 0))),
+        str(int(training.get("warmup_updates", training.get("warmup_steps", 0)))),
         "--mixed_precision",
         str(training.get("mixed_precision", "no")),
         "--precomp_lang_embed",
@@ -177,6 +179,14 @@ def _native_argv(
     report_to = training.get("report_to")
     if report_to:
         argv += ["--report_to", str(report_to)]
+    if config.get("profile") == "aligned_native_aug_v1":
+        # These legacy arguments are explicitly resolved even though aligned
+        # training uses its update-indexed scheduler rather than Diffusers'.
+        argv += ["--image_aug", "--cond_mask_prob", "0", "--cam_ext_mask_prob", "0"]
+        if training.get("gradient_checkpointing", False):
+            argv += ["--gradient_checkpointing"]
+        if cli.mode == "smoke":
+            argv += ["--train_batch_size", "1", "--gradient_accumulation_steps", "1"]
     argv.extend(extra)
     return argv
 
@@ -201,14 +211,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("per-map limits are only allowed for smoke")
     if max_steps < 5 or max_steps % 5:
         raise ValueError("max_train_steps must be a positive multiple of 5")
-    interval = max_steps // 5
+    aligned = config.get("profile") == "aligned_native_aug_v1"
+    interval = (int(training.get("checkpoint_interval_updates", 4000))
+                if aligned and cli.mode != "smoke" else max_steps // 5)
     resume = cli.resume_from_checkpoint is not None
-    if not resume and _is_main_process() and (_occupied(artifact_dir) or _occupied(checkpoint_dir)):
+    if not cli.dry_run and not resume and _is_main_process() and (_occupied(artifact_dir) or _occupied(checkpoint_dir)):
         raise FileExistsError(
             f"Refusing to overwrite existing run; use a new --seed or --resume-from-checkpoint: {artifact_dir}"
         )
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     native_argv = _native_argv(
         config_path=config_path,
@@ -232,7 +242,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     # contract still requires five evenly spaced validation/save points.
     native_steps = int(native_args.max_train_steps)
     native_period = int(native_args.checkpointing_period)
-    if native_steps < 5 or native_steps % 5 or native_period != native_steps // 5:
+    if aligned and cli.mode != "smoke":
+        if native_steps != 19500 or native_period != 4000:
+            raise ValueError("aligned requires 19500 updates and period 4000, with final save at 19500")
+        if int(training.get("validation_interval_updates", 4000)) != 4000:
+            raise ValueError("aligned validation interval must be 4000 updates")
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        effective = world * native_args.train_batch_size * native_args.gradient_accumulation_steps
+        if effective != 128:
+            raise ValueError(f"aligned effective batch must be 128; resolved {world} GPUs * {native_args.train_batch_size} * {native_args.gradient_accumulation_steps} = {effective}")
+        if native_args.learning_rate != 1e-4 or native_args.adam_weight_decay != 0.0 or native_args.lr_warmup_steps != 59:
+            raise ValueError("aligned optimizer contract requires LR=1e-4, weight_decay=0, warmup=59 updates")
+        if not native_args.image_aug or native_args.cond_mask_prob != 0 or native_args.state_noise_snr is not None:
+            raise ValueError("aligned requires native image augmentation, no condition dropout and no state noise")
+        if native_args.scale_lr:
+            raise ValueError("aligned forbids scaling LR by world size or batch size")
+    elif native_steps < 5 or native_steps % 5 or native_period != native_steps // 5:
         raise ValueError(
             "native max_train_steps must be a multiple of 5 and "
             "checkpointing_period must equal max_train_steps / 5"
@@ -260,14 +285,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     native_args.csgo_output_dir = str(artifact_dir)
     native_args.csgo_cpu = bool(cli.cpu)
     native_args.project_root = str(PROJECT_ROOT)
+    native_args.csgo_invocation = {
+        "raw_cli": list(sys.argv[1:] if argv is None else argv),
+        "native_argv": native_argv,
+        "config_path": str(config_path),
+        "checkpoint_steps": ([4000, 8000, 12000, 16000, 19500]
+                             if aligned and cli.mode != "smoke"
+                             else list(range(native_period, native_steps + 1, native_period))),
+    }
     if native_args.report_to in ("none", "null", ""):
         native_args.report_to = None
+    if aligned:
+        from train.csgo_aligned import _checkpoint_steps, _validate_formal
+        _checkpoint_steps(config, native_steps, cli.mode == "smoke")
+        _validate_formal(native_args, config, smoke=cli.mode == "smoke", global_batch=(
+            int(os.environ.get("WORLD_SIZE", "1")) * native_args.train_batch_size
+            * native_args.gradient_accumulation_steps
+        ))
+    if cli.dry_run:
+        print(json.dumps({"profile": config.get("profile", "legacy"), "args": vars(native_args), "yaml": config}, indent=2, default=str))
+        return 0
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     native_train.train(native_args, get_logger("train_seen10"))
     if cli.mode == "smoke":
         # Keep the provenance on each native checkpoint so a later formal
         # inference cannot accidentally consume a five-step smoke model.
-        import json
-
         marker = json.dumps({"smoke_only": True, "seed": seed}, indent=2) + "\n"
         for checkpoint in checkpoint_dir.glob("checkpoint-*"):
             if checkpoint.is_dir():

@@ -22,6 +22,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from data.csgo_update_sampler import SampleOccurrence
+
 
 SEEN_MAPS = (
     "cs_agency",
@@ -107,6 +109,8 @@ class Seen10Dataset(Dataset):
         state_dim: int = 128,
         limit_per_map: int | None = None,
         labels: bool = True,
+        augmentation: Mapping[str, Any] | None = None,
+        external_action_dim: int | None = None,
     ) -> None:
         super().__init__()
         if image_processor is None:
@@ -128,6 +132,14 @@ class Seen10Dataset(Dataset):
         self.tokenizer = tokenizer
         self.state_dim = state_dim
         self.labels = bool(labels)
+        if external_action_dim not in (None, 5):
+            raise ValueError("external_action_dim must be 5 for aligned localization or None for legacy")
+        self.external_action_dim = external_action_dim
+        self.augmentation = dict(augmentation) if augmentation is not None else None
+        if self.augmentation is not None:
+            from data.csgo_augmentation import validate_augmentation
+
+            validate_augmentation(self.augmentation)
         self.language_embeddings = language_embeddings
         self.maps = SEEN_MAPS
         self.map_to_index = dict(MAP_TO_INDEX)
@@ -373,18 +385,24 @@ class Seen10Dataset(Dataset):
             float(pose[4]) * 360.0,
         ]
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int | SampleOccurrence) -> dict[str, Any]:
+        if isinstance(index, SampleOccurrence):
+            occurrence = index
+            index = occurrence.index
+        else:
+            occurrence = SampleOccurrence(index=int(index), epoch=0, global_occurrence=int(index))
         row = self.rows[index]
         pose = self.pose(row)
-        fpv = self._process_path(row["image_path"])
-        radar = self._process_path(row["radar_path"])
+        fpv = self._process_path(row["image_path"], row=row, occurrence=occurrence, view="fpv")
+        radar = self._process_path(row["radar_path"], row=row, occurrence=occurrence, view="radar")
 
         # The native RDT collator expects a list of view tensors and stacks it
         # into (B, 2, C, H, W).  State is always a zero placeholder; GT pose
         # lives only in actions/metadata and is never copied to state.
         state = torch.zeros((1, self.state_dim), dtype=torch.float32)
         state_mask = torch.zeros((self.state_dim,), dtype=torch.float32)
-        state_mask[:5] = 1.0
+        if self.external_action_dim is None:
+            state_mask[:5] = 1.0
         item: dict[str, Any] = {
             "states": state,
             "state_elem_mask": state_mask,
@@ -413,7 +431,7 @@ class Seen10Dataset(Dataset):
             )
 
         if self.labels:
-            action = torch.zeros((1, self.state_dim), dtype=torch.float32)
+            action = torch.zeros((1, self.external_action_dim or self.state_dim), dtype=torch.float32)
             action[0, :5] = torch.as_tensor(pose, dtype=torch.float32)
             item["actions"] = action
             # ``labels`` is a convenient explicit alias for non-RDT heads;
@@ -477,9 +495,29 @@ class Seen10Dataset(Dataset):
             raise ValueError(f"Language embedding for {map_name} must have shape (tokens, dim), got {tuple(value.shape)}")
         return value.detach().cpu()
 
-    def _process_path(self, path: str | os.PathLike[str]) -> torch.Tensor:
+    def _process_path(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        row: Mapping[str, Any] | None = None,
+        occurrence: SampleOccurrence | None = None,
+        view: str | None = None,
+    ) -> torch.Tensor:
         with Image.open(path) as source:
             image = source.convert("RGB")
+        if self.augmentation is not None and self.split == "train":
+            if row is None or occurrence is None or view is None:
+                raise ValueError("Augmentation requires row, occurrence and view identity")
+            from data.csgo_augmentation import augment_image
+
+            image, _ = augment_image(
+                image,
+                config=self.augmentation,
+                epoch=occurrence.epoch,
+                global_occurrence=occurrence.global_occurrence,
+                sample_id=row["sample_id"],
+                view=view,
+            )
         image = _expand_to_square(image, _processor_mean(self.image_processor))
         return _process_image(self.image_processor, image)
 

@@ -5,10 +5,10 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
 UNILIP_PYTHON="${UNILIP_PYTHON:-/home/jiahao/miniconda3/envs/UniLIP/bin/python}"
 EVAL_ROOT="${SHARED_EVAL_DIR:-${CSGO_EVAL_ROOT:-/home/jiahao/task/csgo_benchmark_v2_eval_general}}"
-DATA_ROOT="${DATA_ROOT:-${CSGO_DATA_ROOT:-/home/jiahao/task/UniLIP/data/csgo_benchmark_v2}}"
+DATA_ROOT="${DATA_ROOT:-${CSGO_DATA_ROOT:-}}"
 CONFIG="$PROJECT_ROOT/configs/csgo_seen10.yaml"
 CONFIG_EXPLICIT=0
-SEED=0
+SEED=""
 MODE=""
 OUTPUT_DIR=""
 CHECKPOINT_DIR=""
@@ -20,7 +20,7 @@ usage() {
 Usage: scripts/run_csgo_seen10.sh {train|infer|eval|smoke} [options] [-- mode-specific extra args]
 
 Options:
-  --seed N                 Seed directory (default: 0)
+  --seed N                 Seed directory (default: YAML seed)
   --config PATH            Seen-10 YAML config
   --data-root PATH         Released benchmark bundle
   --output-dir PATH        Complete artifact directory for this seed
@@ -97,22 +97,31 @@ if [[ "$MODE" == "smoke" && "$CONFIG_EXPLICIT" == 0 && -f "$PROJECT_ROOT/.cache/
   CONFIG="$PROJECT_ROOT/.cache/csgo_seen10/smoke/config.yaml"
 fi
 
-if [[ -z "$OUTPUT_DIR" ]]; then
-  if [[ "$MODE" == "smoke" ]]; then
-    OUTPUT_DIR="$PROJECT_ROOT/outputs/csgo_benchmark_v2_seen10/RDT/smoke/seed_${SEED}"
-  else
-    OUTPUT_DIR="$PROJECT_ROOT/outputs/csgo_benchmark_v2_seen10/RDT/seed_${SEED}"
-  fi
-fi
-if [[ -z "$CHECKPOINT_DIR" ]]; then
-  if [[ "$MODE" == "smoke" ]]; then
-    CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/csgo_benchmark_v2_seen10/RDT/smoke/seed_${SEED}"
-  else
-    CHECKPOINT_DIR="$PROJECT_ROOT/checkpoints/csgo_benchmark_v2_seen10/RDT/seed_${SEED}"
-  fi
-fi
-
 cd "$PROJECT_ROOT"
+
+# Resolve defaults from the chosen profile; never replace aligned paths with
+# legacy seed_0 defaults. Explicit CLI/environment paths still win.
+resolved="$("$PYTHON" - "$CONFIG" "$SEED" "$MODE" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+c = yaml.safe_load(Path(sys.argv[1]).read_text())
+seed = int(sys.argv[2]) if sys.argv[2] else int(c.get('seed', 0))
+parts = [str(c.get('model_name', 'RDT'))]
+if sys.argv[3] == 'smoke':
+    parts.append('smoke')
+parts.append(f'seed_{seed}')
+print(seed)
+print(c['data_root'])
+print(Path(c.get('output_root', 'outputs/csgo_benchmark_v2_seen10')).joinpath(*parts))
+print(Path(c.get('checkpoint_root', 'checkpoints/csgo_benchmark_v2_seen10')).joinpath(*parts))
+PY
+)"
+mapfile -t profile_paths <<< "$resolved"
+SEED="${profile_paths[0]}"
+DATA_ROOT="${DATA_ROOT:-${profile_paths[1]}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${profile_paths[2]}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${profile_paths[3]}}"
 
 cpu_args=()
 if ((CPU)); then
@@ -137,6 +146,7 @@ case "$MODE" in
     "$UNILIP_PYTHON" "$EVAL_ROOT/run_eval.py" localization \
       --pred-root "$OUTPUT_DIR/localization" \
       --data-root "$DATA_ROOT" \
+      --pose-space normalized \
       --output "$OUTPUT_DIR/evaluation/localization"
     ;;
   smoke)

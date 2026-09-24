@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -101,10 +104,10 @@ def _run_paths(config: Mapping[str, Any], config_path: Path, cli: argparse.Names
     return data_root, output_dir, checkpoint_dir
 
 
-def _checkpoint_path(root: Path) -> Path:
+def _checkpoint_path(root: Path, *, rule: str | None = None) -> Path:
     if root.is_file():
         return root
-    for name in ("best", "late"):
+    for name in ((rule,) if rule else ("best", "late")):
         candidate = root / name
         if candidate.exists():
             return candidate
@@ -167,7 +170,8 @@ def _load_existing(path: Path) -> tuple[list[dict[str, Any]], set[tuple[str, str
     return rows, identities
 
 
-def _provenance(path: Path, *, checkpoint: Path, seed: int, data_root: Path) -> None:
+def _provenance(path: Path, *, checkpoint: Path, seed: int, data_root: Path,
+                extra: Mapping[str, Any] | None = None) -> None:
     expected = {
         "model_name": "RDT",
         "task": "localization",
@@ -178,6 +182,17 @@ def _provenance(path: Path, *, checkpoint: Path, seed: int, data_root: Path) -> 
         "prediction_pose_space": "normalized",
         "model_inputs_contain_ground_truth": False,
     }
+    if extra:
+        expected.update(extra)
+    def portable(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        if isinstance(value, Mapping):
+            return {key: portable(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [portable(item) for item in value]
+        return value
+    expected = portable(expected)
     if path.is_file():
         with path.open("r", encoding="utf-8") as stream:
             existing = json.load(stream)
@@ -282,7 +297,11 @@ def _predict(
             )
             action_mask[..., :5] = 1
             prepared["action_mask"] = action_mask
-            prediction = model.predict_action(**prepared).detach().float().cpu()
+            context = (torch.autocast(device_type=accelerator.device.type, dtype=dtype)
+                       if getattr(model, "diffusion_channel_policy", "legacy_valid5") == "native_full"
+                       and dtype == torch.bfloat16 else contextlib.nullcontext())
+            with context:
+                prediction = model.predict_action(**prepared).detach().float().cpu()
             metadata = batch["metadata"]
             for index, item in enumerate(metadata):
                 values = prediction[index, 0, :5].tolist()
@@ -305,13 +324,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     cli = build_parser().parse_args(argv)
     config_path = cli.config_path.expanduser().resolve()
     config = _yaml(config_path)
+    aligned = config.get("profile") == "aligned_native_aug_v1"
     data_root, output_dir, checkpoint_root = _run_paths(config, config_path, cli)
     seed = int(cli.seed if cli.seed is not None else config.get("seed", 0))
+    if aligned and seed != 42:
+        raise ValueError("The approved aligned inference seed is 42")
     if cli.mode == "infer" and cli.limit_per_map is not None:
         raise ValueError("--limit-per-map is only allowed for smoke")
     limit_per_map = cli.limit_per_map if cli.limit_per_map is not None else (10 if cli.mode == "smoke" else None)
-    batch_size = cli.batch_size or int(config.get("training", {}).get("eval_batch_size", 1))
-    checkpoint = _checkpoint_path(checkpoint_root)
+    batch_size = cli.batch_size or int(config.get("inference", {}).get("batch_size", config.get("training", {}).get("eval_batch_size", 1)))
+    if aligned and (batch_size != 1 or int(os.environ.get("WORLD_SIZE", "1")) != 1):
+        raise ValueError("aligned inference requires batch size 1 and a single process")
+    checkpoint = _checkpoint_path(checkpoint_root, rule="late" if aligned else None).resolve()
     _reject_smoke_checkpoint(checkpoint, formal=cli.mode == "infer")
     predictions_path = output_dir / "localization" / "predictions.jsonl"
     provenance_path = output_dir / "localization" / "inference_provenance.json"
@@ -320,7 +344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Existing predictions have no provenance file: {predictions_path}; "
             "refusing to guess their checkpoint or seed"
         )
-    _provenance(provenance_path, checkpoint=checkpoint, seed=seed, data_root=data_root)
+    if not aligned:
+        _provenance(provenance_path, checkpoint=checkpoint, seed=seed, data_root=data_root)
     existing, identities = _load_existing(predictions_path)
 
     if cli.cpu or not torch.cuda.is_available():
@@ -331,6 +356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         accelerator = Accelerator()
         dtype = torch.bfloat16 if config.get("training", {}).get("mixed_precision") == "bf16" else torch.float32
     device = accelerator.device
+    if aligned and accelerator.num_processes != 1:
+        raise ValueError("aligned inference requires a single process")
     set_seed(seed)
 
     vision_path = _asset(config.get("pretrained_vision_encoder_name_or_path"), config_path)
@@ -363,14 +390,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     unexpected = identities - expected
     if unexpected:
         raise ValueError(f"Existing predictions contain identities outside this split: {sorted(unexpected)[:5]}")
+    if aligned and existing and len(identities) != len(expected):
+        raise ValueError("Partial aligned predictions cannot be resumed by skipping IDs because this changes diffusion noise allocation. Use a new output directory and rerun from the first sample.")
     pending = [
         index
         for index, row in enumerate(dataset.rows)
         if (str(row["map_name"]), str(row["sample_id"])) not in identities
     ]
-    if pending:
+    if pending or aligned:
         model = CSGORDTRunner.from_pretrained(checkpoint, dtype=dtype)
-        model.to(device=device, dtype=dtype).eval()
+        if aligned:
+            if getattr(model, "diffusion_channel_policy", None) != "native_full":
+                raise ValueError("aligned inference requires a native_full checkpoint")
+            if model.num_inference_timesteps != 5:
+                raise ValueError("aligned inference requires the approved five solver steps")
+            model.to(device=device).eval()
+            import diffusers
+            manifest = data_root / "benchmark_manifest.json"
+            order = [(str(row["map_name"]), str(row["sample_id"])) for row in dataset.rows]
+            _provenance(provenance_path, checkpoint=checkpoint, seed=seed, data_root=data_root, extra={
+                "profile": config["profile"], "batch_size": batch_size,
+                "num_processes": accelerator.num_processes, "augmentation": "none",
+                "solver": type(model.noise_scheduler_sample).__name__,
+                "solver_config": {key: value for key, value in model.noise_scheduler_sample.config.items()
+                                  if not key.startswith("_")},
+                "num_inference_timesteps": model.num_inference_timesteps,
+                "diffusers_version": diffusers.__version__, "torch_version": torch.__version__,
+                "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "sample_order_sha256": hashlib.sha256(json.dumps(order).encode()).hexdigest(),
+                "checkpoint_config_sha256": hashlib.sha256((checkpoint / "config.json").read_bytes()).hexdigest(),
+                "partial_output_policy": "reject",
+            })
+        else:
+            model.to(device=device, dtype=dtype).eval()
+    if pending:
         _predict(
             model,
             dataset,
@@ -396,13 +449,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(visualization, dict):
         visualization = {}
     viz_seed = int(cli.visualization_seed if cli.visualization_seed is not None else visualization.get("seed", 0))
-    render_localization(
-        dataset,
-        predictions_path,
-        output_dir / "localization" / "visualization",
-        seed=viz_seed,
-        per_map=int(visualization.get("samples_per_map", 10)),
-    )
+    if visualization.get("enabled", True):
+        render_localization(
+            dataset,
+            predictions_path,
+            output_dir / "localization" / "visualization",
+            seed=viz_seed,
+            per_map=int(visualization.get("samples_per_map", 10)),
+        )
     print(json.dumps({
         "seed": seed,
         "checkpoint": str(checkpoint),
