@@ -38,7 +38,12 @@ bash scripts/setup_csgo_seen10.sh
 另一台服务器已确认是 A100、驱动 580.125.09、`nvidia-smi` 显示 CUDA 13.0；新建环境可明确使用下面的 cu128 配置。它安装 PyTorch 2.8.0 / torchvision 0.23.0 的 CUDA 12.8 wheel，CUDA 13.0 的显示值不是必须安装的 wheel 版本。配对依据 [PyTorch 官方版本表](https://pytorch.org/get-started/previous-versions/)，驱动向后兼容依据 [NVIDIA 兼容性说明](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)。
 
 ```bash
+cd ~/task/RoboticsDiffusionTransformer
+
 RDT_TORCH_BACKEND=cu128 bash scripts/setup_csgo_seen10.sh
+bash scripts/setup_csgo_seen10.sh --check
+
+.venv/bin/python scripts/prepare_csgo_assets.py
 ```
 
 ```bash
