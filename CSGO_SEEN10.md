@@ -29,6 +29,7 @@ aligned 与 UniLIP `exp32_loc` 对齐官方 split、5D 目标、样本暴露量�
 cd ~/task/RoboticsDiffusionTransformer
 bash scripts/setup_csgo_seen10.sh
 .venv/bin/python scripts/prepare_csgo_assets.py
+bash scripts/setup_csgo_seen10.sh --check
 ```
 
 环境脚本优先复用已有 `.venv`；新建时使用 Python 3.11 的 venv，若本机没有 Python 3.11 则通过 conda 创建。可用 `RDT_SETUP_PYTHON` 指定 Python 3.11，或显式设置 `RDT_CLONE_SOURCE` 克隆已有 conda 环境。已存在的环境不会因克隆源缺失而失败。
@@ -44,6 +45,7 @@ RDT_TORCH_BACKEND=cu128 bash scripts/setup_csgo_seen10.sh
 bash scripts/setup_csgo_seen10.sh --check
 
 .venv/bin/python scripts/prepare_csgo_assets.py
+bash scripts/setup_csgo_seen10.sh --check
 ```
 
 ```bash
@@ -52,6 +54,8 @@ bash scripts/setup_csgo_seen10.sh --check    # 检查已有环境，不安装或
 ```
 
 全新环境使用 [requirements_csgo.txt](requirements_csgo.txt) 中的兼容版本，包括 NumPy 1.26.4；原生 `imgaug` 不兼容 NumPy 2.x。已有环境保留已安装版本并检查实际导入，发现冲突时报告错误。定位流程不要求安装 DeepSpeed、TensorFlow 或生成评测依赖。准备脚本不下载模型；上面的资产准备命令才会下载或校验官方权重。
+
+T5 tokenizer 还需要 `sentencepiece` 和 `protobuf`（导入名为 `google.protobuf`），两者均已纳入依赖。若旧版环境在训练启动时报 `requires the protobuf library but it was not found`，同步代码后重新执行 `bash scripts/setup_csgo_seen10.sh` 即可补装，无需重建 `.venv`。`--check` 会检查 SentencePiece protobuf schema；官方 T5 缓存存在时，还会仅用本地文件加载 tokenizer 并编码文本，不加载模型权重、不联网。资产尚未下载时会明确显示 tokenizer 检查跳过，因此应在资产准备完成后再执行一次 `--check`。
 
 当前服务器已有 PyTorch nightly 环境会保留，新服务器默认采用上述稳定版，因此不承诺两台机器的浮点结果逐位一致；实验报告应保留各自 `--check` 输出及推理 provenance 中的依赖版本。
 

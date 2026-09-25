@@ -329,3 +329,12 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - 本机实际 `setup_csgo_seen10.sh --check` 通过：Python 3.11.14、Torch 2.11.0.dev20260124+cu128、torchvision 0.25.0.dev20260124+cu128、NumPy 1.26.4；训练/推理模块导入成功，CUDA 可用。
 - aligned dry-run、wrapper 路径打印、shell 语法、文档命令语法和 `git diff --check` 通过。
 - 没有执行依赖安装、模型下载、正式训练/推理/评测。新服务器的实际安装与 GPU 运行尚待用户同步后验证；不把模拟安装分支测试当作另一台机器的实测。
+
+### 9.6 2026-09-25 tokenizer 依赖修复
+
+另一台服务器训练启动日志报告缺少 protobuf。此前准备脚本只检查模型类导入，未覆盖 T5 tokenizer 转换；本机已有 protobuf，因此此前导入检查不能证明新环境具备这一依赖。
+
+- 依赖清单新增 `protobuf==6.33.4`；已有环境检测使用真实导入名 `google.protobuf`，兼容 `google` 命名空间本身也不存在的情况，已有版本不强制重装。
+- `--check` 检查 protobuf message 和 SentencePiece schema；缓存存在时实际离线加载 T5 tokenizer 并编码，不加载 T5 权重。缓存不存在时明确跳过，要求资产下载后重查。
+- 10 项准备脚本测试通过（原 7 项加缺失命名空间、缺失 protobuf、已安装 protobuf 三种回归场景）；本机真实 tokenizer 加载/编码和完整 `--check` 通过。
+- 未安装依赖、下载模型或启动训练；截图只展示异常尾部，另一台服务器修复后的运行仍需用户验证。

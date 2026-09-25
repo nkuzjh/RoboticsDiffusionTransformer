@@ -10,6 +10,7 @@ scipy==1.17.0
 h5py==3.11.0
 imgaug==0.4.0
 sentencepiece==0.2.0
+protobuf==6.33.4
 einops==0.8.1
 packaging==25.0
 tqdm==4.67.1

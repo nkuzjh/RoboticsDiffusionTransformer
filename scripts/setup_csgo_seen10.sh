@@ -187,14 +187,20 @@ import importlib.util
 from pathlib import Path
 import sys
 
-modules = {"pillow": "PIL", "pyyaml": "yaml", "opencv-python-headless": "cv2", "huggingface-hub": "huggingface_hub"}
+modules = {"pillow": "PIL", "pyyaml": "yaml", "opencv-python-headless": "cv2", "huggingface-hub": "huggingface_hub", "protobuf": "google.protobuf"}
 for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     line = raw.strip()
     if not line or line.startswith("#"):
         continue
     distribution = line.split("==", 1)[0]
     module = modules.get(distribution.lower(), distribution.replace("-", "_"))
-    if importlib.util.find_spec(module) is None:
+    try:
+        available = importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        # A missing namespace parent (e.g. google) also means the dependency
+        # is missing; do not abort the probe before printing its requirement.
+        available = False
+    if not available:
         print(line)
 PY
 )
@@ -228,7 +234,7 @@ from packaging.version import Version
 required = (
     "torch", "torchvision", "transformers", "diffusers", "huggingface_hub",
     "accelerate", "timm", "numpy", "PIL", "yaml", "h5py", "imgaug",
-    "sentencepiece", "cv2", "einops", "safetensors", "tqdm",
+    "sentencepiece", "google.protobuf", "google.protobuf.message", "cv2", "einops", "safetensors", "tqdm",
 )
 failed = []
 for name in required:
@@ -240,7 +246,11 @@ if failed:
     raise SystemExit("CSGO dependency verification failed:\n  " + "\n  ".join(failed))
 
 try:
-    from transformers import T5EncoderModel, SiglipVisionModel, SiglipImageProcessor
+    from transformers import AutoTokenizer, T5EncoderModel, SiglipVisionModel, SiglipImageProcessor
+    from transformers.convert_slow_tokenizer import import_protobuf
+    # Exercise the SentencePiece protobuf schema used by slow-to-fast T5
+    # conversion even before official model assets have been downloaded.
+    import_protobuf().ModelProto().SerializeToString()
     from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
     from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
     from accelerate import Accelerator
@@ -250,13 +260,29 @@ try:
 except Exception as exc:
     raise SystemExit(f"CSGO code import verification failed: {type(exc).__name__}: {exc}")
 
+from pathlib import Path
+tokenizer_dir = Path(sys.argv[1]) / ".cache/csgo_seen10/models/t5-v1_1-xxl"
+if tokenizer_dir.is_dir():
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_dir, model_max_length=1024, local_files_only=True,
+        )
+        encoded = tokenizer("Locate the player on de_dust2.", return_tensors="pt")
+        if encoded["input_ids"].numel() == 0:
+            raise ValueError("tokenizer produced empty input_ids")
+        print("T5 tokenizer local load/encode: OK", type(tokenizer).__name__)
+    except Exception as exc:
+        raise SystemExit(f"CSGO local T5 tokenizer check failed at {tokenizer_dir}: {type(exc).__name__}: {exc}")
+else:
+    print("T5 tokenizer local load/encode: SKIPPED (assets absent; rerun --check after prepare_csgo_assets.py)")
+
 import torch
 if Version(torch.__version__.split("+", 1)[0]) < Version("2.6.0"):
     raise SystemExit("CSGO requires torch >= 2.6 to safely load the official T5 pytorch_model.bin; use a matching supported torch/torchvision pair")
 print("python", sys.version.replace("\n", " "))
 for distribution in (
     "torch", "torchvision", "transformers", "diffusers", "huggingface-hub",
-    "accelerate", "timm", "numpy", "sentencepiece", "h5py", "imgaug",
+    "accelerate", "timm", "numpy", "sentencepiece", "protobuf", "h5py", "imgaug",
 ):
     print(f"{distribution} {metadata.version(distribution)}")
 print("torch.cuda.is_available", torch.cuda.is_available())

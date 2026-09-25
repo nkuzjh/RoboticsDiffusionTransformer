@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import os
+import contextlib
+import io
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +45,29 @@ class SetupScriptTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = _staged_setup(Path(self.tmp.name))
+
+    def _missing_dependencies(self, finder) -> str:
+        source = (self.root / 'scripts/setup_csgo_seen10.sh').read_text()
+        probe = re.search(r"mapfile -t MISSING < <.*?<<'PY'\n(.*?)\nPY", source, re.S).group(1)
+        output = io.StringIO()
+        with patch('sys.argv', ['-', str(self.root / 'requirements_csgo.txt')]), \
+                patch('importlib.util.find_spec', side_effect=finder), contextlib.redirect_stdout(output):
+            exec(compile(probe, 'setup-missing-dependency-probe', 'exec'), {})
+        return output.getvalue()
+
+    def test_missing_google_namespace_installs_protobuf(self) -> None:
+        def finder(module):
+            if module == 'google.protobuf':
+                raise ModuleNotFoundError("No module named 'google'")
+            return object()
+        self.assertEqual(self._missing_dependencies(finder), 'protobuf==6.33.4\n')
+
+    def test_missing_protobuf_under_existing_google_namespace(self) -> None:
+        self.assertEqual(self._missing_dependencies(
+            lambda module: None if module == 'google.protobuf' else object()), 'protobuf==6.33.4\n')
+
+    def test_existing_google_protobuf_is_not_reinstalled(self) -> None:
+        self.assertEqual(self._missing_dependencies(lambda module: object()), '')
 
     def test_existing_environment_ignores_absent_clone_and_backend(self) -> None:
         python = self.root / ".venv/bin/python"
