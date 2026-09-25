@@ -2,6 +2,8 @@
 # PyTorch and torchvision are installed as a matching backend-specific pair by
 # scripts/setup_csgo_seen10.sh. Existing envs keep already importable packages.
 # Offline dataset converters, TensorFlow, DeepSpeed and W&B are not required.
+# Install via setup_csgo_seen10.sh: imgaug also pulls the GUI OpenCV package;
+# the script removes overlapping cv2 owners and reinstalls headless afterwards.
 numpy==1.26.4
 Pillow==10.4.0
 PyYAML==6.0.3

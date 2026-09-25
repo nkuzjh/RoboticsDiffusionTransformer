@@ -55,6 +55,17 @@ bash scripts/setup_csgo_seen10.sh --check    # 检查已有环境，不安装或
 
 全新环境使用 [requirements_csgo.txt](requirements_csgo.txt) 中的兼容版本，包括 NumPy 1.26.4；原生 `imgaug` 不兼容 NumPy 2.x。已有环境保留已安装版本并检查实际导入，发现冲突时报告错误。定位流程不要求安装 DeepSpeed、TensorFlow 或生成评测依赖。准备脚本不下载模型；上面的资产准备命令才会下载或校验官方权重。
 
+OpenCV 是上述“保留已有版本”的例外：准备脚本在所有依赖安装结束后，统一为单一的 `opencv-python-headless==4.11.0.86`。`imgaug` 的包依赖声明会拉入 GUI 版 `opencv-python`，而 OpenCV 的四种发行包共用 `cv2` 文件；混装可能导致无图形界面的服务器报 `libGL.so.1` 缺失。脚本会先卸载冲突的 OpenCV 包，再以 `--no-deps --force-reinstall` 安装固定 headless 版，避免卸载共用文件后留下损坏的 `cv2`，也避免改变 NumPy/PyTorch。已正确安装时重复执行不会重装；`--check` 只诊断，不修复。此处理遵循 [OpenCV 的单一发行包安装说明](https://pypi.org/project/opencv-python-headless/4.11.0.86/)。
+
+遇到 `imgaug`/`cv2` 导入时报 `libGL.so.1`，同步代码后重跑准备脚本即可；无需安装系统 GUI 库或使用 sudo：
+
+```bash
+bash scripts/setup_csgo_seen10.sh
+bash scripts/setup_csgo_seen10.sh --check
+```
+
+以后再次用 pip 安装 `imgaug` 或其关联依赖，可能重新拉入 GUI 版，此时也应重跑准备脚本。`pip check` 可能仍报告 imgaug 声明的 `opencv-python` 未安装，这是两个 OpenCV 发行包的名称不互相替代所致；不要为了消除这一元数据提示再次混装，运行检查应确认 `cv2` 与 `imgaug` 均可导入且仅保留 headless 版。
+
 T5 tokenizer 还需要 `sentencepiece` 和 `protobuf`（导入名为 `google.protobuf`），两者均已纳入依赖。若旧版环境在训练启动时报 `requires the protobuf library but it was not found`，同步代码后重新执行 `bash scripts/setup_csgo_seen10.sh` 即可补装，无需重建 `.venv`。`--check` 会检查 SentencePiece protobuf schema；官方 T5 缓存存在时，还会仅用本地文件加载 tokenizer 并编码文本，不加载模型权重、不联网。资产尚未下载时会明确显示 tokenizer 检查跳过，因此应在资产准备完成后再执行一次 `--check`。
 
 当前服务器已有 PyTorch nightly 环境会保留，新服务器默认采用上述稳定版，因此不承诺两台机器的浮点结果逐位一致；实验报告应保留各自 `--check` 输出及推理 provenance 中的依赖版本。

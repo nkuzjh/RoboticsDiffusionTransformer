@@ -338,3 +338,13 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - `--check` 检查 protobuf message 和 SentencePiece schema；缓存存在时实际离线加载 T5 tokenizer 并编码，不加载 T5 权重。缓存不存在时明确跳过，要求资产下载后重查。
 - 10 项准备脚本测试通过（原 7 项加缺失命名空间、缺失 protobuf、已安装 protobuf 三种回归场景）；本机真实 tokenizer 加载/编码和完整 `--check` 通过。
 - 未安装依赖、下载模型或启动训练；截图只展示异常尾部，另一台服务器修复后的运行仍需用户验证。
+
+### 9.7 2026-09-25 无图形界面服务器的 OpenCV 修复
+
+补装 protobuf 后，另一台服务器报告 `imgaug`/`cv2` 因缺少 `libGL.so.1` 导入失败。本机包元数据确认 `imgaug==0.4.0` 声明依赖 `opencv-python`；即使清单指定 headless，pip 仍可能同时安装 GUI 版。四种 OpenCV 发行包共用 `cv2` 文件，不能依赖安装顺序决定实际加载哪一版。
+
+- 准备脚本在所有依赖安装后检查四种发行包，检测到混装、GUI 包、版本不符或导入失败时，卸载已有 OpenCV 发行包并以 `--no-deps --force-reinstall` 安装 `opencv-python-headless==4.11.0.86`；不改动 NumPy、PyTorch 或训练配置。
+- 健康检查验证实际 OpenCV 构建的 `GUI: NONE`；`--check` 只读报错并提示重跑准备脚本。pip 操作失败会停止，不输出环境 ready。
+- 10 项准备脚本检查与 4 项 OpenCV 模拟检查通过，包括混装修复、重复执行不重装、损坏的 headless 导入、卸载/安装失败传播。
+- 临时目录实际安装 headless wheel，使用子进程阻断 libGL：原 GUI OpenCV 导入失败，headless OpenCV 与 RDT 增强正常运行。64 次固定 occurrence 覆盖颜色、corruption、组合及不增强，和原环境输出 SHA256 一致：`cd1c755d3d5f3ef854204e810d31f7a178153d2baae681effafe6b0739858782`。这验证本次样本上的一致性，不代表所有平台逐位等价。
+- 实测摘要见 [.cache/csgo_seen10/opencv_headless_acceptance_20260925.json](.cache/csgo_seen10/opencv_headless_acceptance_20260925.json)。本机现有 `.venv` 未修改，其中也检测到 GUI/headless 混装，新 `--check` 正确拒绝该状态；只有用户手动执行 setup 才会修复。本轮仅在 `/tmp` 安装 OpenCV 测试包，没有下载模型或启动正式任务。

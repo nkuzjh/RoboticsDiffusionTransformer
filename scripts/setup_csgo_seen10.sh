@@ -180,8 +180,9 @@ PY
         "${PYTHON}" -m pip install --disable-pip-version-check --no-input \
             -r "${REQUIREMENTS}"
     else
-        # Probe imports, not only distribution names: opencv-python and
-        # opencv-python-headless both provide cv2. Keep existing versions.
+        # Probe imports here to avoid reinstalling unrelated packages. OpenCV
+        # ownership is checked separately after all pip installs: imgaug's
+        # metadata can pull in the GUI wheel even when headless is present.
         mapfile -t MISSING < <("${PYTHON}" - "${REQUIREMENTS}" <<'PY'
 import importlib.util
 from pathlib import Path
@@ -223,6 +224,80 @@ PY
             echo "setup_csgo_seen10: CSGO packages are already present" >&2
         fi
     fi
+fi
+
+# The four OpenCV wheels install files into the same cv2 package. In
+# particular, imgaug declares opencv-python even though its augmentation
+# functions also work with the headless wheel. A fresh pip -r can therefore
+# leave both variants installed; import cv2 then fails on servers without
+# libGL. Normalize only after every resolver-driven install has finished.
+OPENCV_HEADLESS_PIN="$("${PYTHON}" - "${REQUIREMENTS}" <<'PY'
+from pathlib import Path
+import sys
+
+pins = [line.strip() for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+        if line.strip().lower().startswith("opencv-python-headless==")]
+if len(pins) != 1:
+    raise SystemExit("requirements_csgo.txt must pin exactly one opencv-python-headless version")
+print(pins[0])
+PY
+)"
+
+opencv_packages() {
+    "${PYTHON}" - <<'PY'
+from importlib import metadata
+
+for name in ("opencv-python", "opencv-python-headless", "opencv-contrib-python", "opencv-contrib-python-headless"):
+    try:
+        metadata.version(name)
+    except metadata.PackageNotFoundError:
+        continue
+    print(name)
+PY
+}
+
+opencv_headless_healthy() {
+    "${PYTHON}" - "${OPENCV_HEADLESS_PIN#*==}" <<'PY'
+from importlib import metadata
+import re
+import sys
+
+if metadata.version("opencv-python-headless") != sys.argv[1]:
+    raise SystemExit(1)
+import cv2
+if not cv2.__file__:
+    raise SystemExit(1)
+if not re.search(r"(?m)^\s*GUI:\s*NONE(?:\s|$)", cv2.getBuildInformation()):
+    raise SystemExit("cv2 was built with GUI support")
+PY
+}
+
+OPENCV_PACKAGES_OUTPUT="$(opencv_packages)" \
+    || die "cannot inspect installed OpenCV distributions in ${ENV_DIR}"
+OPENCV_DISTRIBUTIONS=()
+if [[ -n "${OPENCV_PACKAGES_OUTPUT}" ]]; then
+    mapfile -t OPENCV_DISTRIBUTIONS <<< "${OPENCV_PACKAGES_OUTPUT}"
+fi
+if [[ ${#OPENCV_DISTRIBUTIONS[@]} != 1 || "${OPENCV_DISTRIBUTIONS[0]:-}" != opencv-python-headless ]] \
+    || ! opencv_headless_healthy >/dev/null 2>&1; then
+    if [[ "${MODE}" == check ]]; then
+        die "OpenCV is not a healthy, sole ${OPENCV_HEADLESS_PIN} install (found: ${OPENCV_DISTRIBUTIONS[*]:-none}); run bash scripts/setup_csgo_seen10.sh to repair it"
+    fi
+    echo "setup_csgo_seen10: repairing OpenCV; found: ${OPENCV_DISTRIBUTIONS[*]:-none}" >&2
+    if (( ${#OPENCV_DISTRIBUTIONS[@]} )); then
+        "${PYTHON}" -m pip uninstall --disable-pip-version-check --yes "${OPENCV_DISTRIBUTIONS[@]}"
+    fi
+    "${PYTHON}" -m pip install --disable-pip-version-check --no-input \
+        --no-deps --force-reinstall "${OPENCV_HEADLESS_PIN}"
+    OPENCV_PACKAGES_OUTPUT="$(opencv_packages)" \
+        || die "cannot inspect OpenCV distributions after repair"
+    OPENCV_DISTRIBUTIONS=()
+    if [[ -n "${OPENCV_PACKAGES_OUTPUT}" ]]; then
+        mapfile -t OPENCV_DISTRIBUTIONS <<< "${OPENCV_PACKAGES_OUTPUT}"
+    fi
+    [[ ${#OPENCV_DISTRIBUTIONS[@]} == 1 && "${OPENCV_DISTRIBUTIONS[0]}" == opencv-python-headless ]] \
+        && opencv_headless_healthy \
+        || die "OpenCV repair did not produce a working ${OPENCV_HEADLESS_PIN}; inspect the pip output above"
 fi
 
 "${PYTHON}" - "${PROJECT_ROOT}" <<'PY'
