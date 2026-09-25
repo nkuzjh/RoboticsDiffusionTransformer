@@ -67,6 +67,17 @@ def _positive_int(value: str) -> int:
     return result
 
 
+def _resolve_batch_size(config: Mapping[str, Any], override: int | None = None) -> int:
+    """Inference batches are independent of the training update budget."""
+    value = override if override is not None else config.get("inference", {}).get(
+        "batch_size", config.get("training", {}).get("eval_batch_size", 1),
+    )
+    try:
+        return _positive_int(str(value))
+    except (ValueError, argparse.ArgumentTypeError) as exc:
+        raise ValueError(f"inference batch size must be a positive integer, got {value!r}") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("infer", "smoke"), nargs="?", default="infer")
@@ -333,9 +344,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cli.mode == "infer" and cli.limit_per_map is not None:
         raise ValueError("--limit-per-map is only allowed for smoke")
     limit_per_map = cli.limit_per_map if cli.limit_per_map is not None else (10 if cli.mode == "smoke" else None)
-    batch_size = cli.batch_size or int(config.get("inference", {}).get("batch_size", config.get("training", {}).get("eval_batch_size", 1)))
-    if aligned and (batch_size != 1 or int(os.environ.get("WORLD_SIZE", "1")) != 1):
-        raise ValueError("aligned inference requires batch size 1 and a single process")
+    batch_size = _resolve_batch_size(config, cli.batch_size)
+    if aligned and int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("aligned inference requires a single process")
     checkpoint = _checkpoint_path(checkpoint_root, rule="late" if aligned else None).resolve()
     _reject_smoke_checkpoint(checkpoint, formal=cli.mode == "infer")
     predictions_path = output_dir / "localization" / "predictions.jsonl"

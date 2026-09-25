@@ -143,7 +143,8 @@ scheduler仅随成功optimizer update推进一次，不按microbatch/world size�
 
 ## 6. 预算、checkpoint 与恢复
 
-默认seed42，单GPU microbatch4 × accumulation32，全局有效定位batch **128**。
+默认seed42，当前单GPU microbatch32 × accumulation4，全局有效定位batch **128**。
+新运行仅约束world size × microbatch × accumulation = 128，各项须为正整数，不固定某一种拆分。
 每epoch打乱50,000条、取49,920条，形成390个完整global batch；50epochs合计
 **19,500 updates、2,496,000次定位样本暴露**。尾部80条不padding/复制，下一epoch重排。
 先组成global update再拆rank/microbatch，避免分布式重复填充或二次切分。
@@ -162,7 +163,7 @@ scheduler仅随成功optimizer update推进一次，不按microbatch/world size�
 主比较用final/late，best-val仅为标注清楚的附加结果；历史UniLIP每2000步保存，不能声称旧运行搜索密度相同。
 
 每次validation使用全部5000条，固定seed和原生5-step推理，保存/恢复训练RNG。
-默认validation batch4，与正式测试batch1分别记录；主loss与验证指标不同。
+当前validation batch32，可通过training.eval_batch_size调整；正式测试batch默认1，可通过inference.batch_size或CLI设置任意正整数，保持单进程。实际batch分别记录；主loss与验证指标不同。
 不使用test选择checkpoint、LR、增强或推理设置。
 
 checkpoint保存模型、config、optimizer、scheduler、各rank RNG、完成update与sampler恢复位置。
@@ -170,7 +171,7 @@ checkpoint保存模型、config、optimizer、scheduler、各rank RNG、完成up
 smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 
 同实验的完整恢复校验YAML、实际batch/world size、资产、manifest、语言embedding哈希和optimizer设置。
-新运行更改GPU数仍须保持batch128；不承诺任意改变正在恢复的rank/microbatch/accumulation后逐位一致。
+新运行更改GPU数仍须保持batch128；旧checkpoint保持严格恢复检查，改变配置或rank/microbatch/accumulation即使仍满足batch128也不能绕过检查。
 
 ## 7. 配置与文件级实现边界
 
@@ -187,7 +188,7 @@ smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 | train/train.py | 按profile分派；保留legacy/native分支 |
 | train/csgo_aligned.py | update/optimizer/scheduler、协议约束、五次保存验证、完整恢复和审计 |
 | train_seen10.py | CLI/YAML解析、原始参数记录、预算/节点校验、dry-run与smoke边界 |
-| infer_seen10.py | aligned默认late、seed42/batch1/单进程、求解器provenance、标准预测和coverage |
+| infer_seen10.py | aligned默认late、seed42/单进程、可配置正整数batch（默认1）、求解器provenance、标准预测和coverage |
 | scripts/run_csgo_seen10.sh | 所选YAML决定默认seed/输出目录；eval调用共享原evaluator |
 | scripts/csgo_paths.py | 跨服务器数据/评测目录解析；评测解释器按 OpenVLA 优先级选择，默认使用统一 evaluator 环境 |
 | scripts/setup_csgo_seen10.sh | 创建或复用项目环境，检查依赖；不要求另一项目的环境存在 |
@@ -357,3 +358,10 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - YAML 结构比较确认仅评测解释器字段变化；训练/推理超参数、4000/8000/12000/16000/19500 保存节点没有变化。完整配置哈希仍严格校验，因此恢复旧 aligned checkpoint 必须使用其原配置；评测可通过新 CLI/env 覆盖环境，无需改动旧配置。
 - 9 项路径检查与 4 项 aligned 入口检查通过，覆盖两种 CLI 别名、两种环境变量的优先级、YAML 覆盖、评测器目录联动、symlink 保留、不探测显式路径、缺失解释器不回退。
 - 未设置解释器覆盖时，当前主机的路径打印确认评测使用 `/home/jiahao/task/csgo_benchmark_v2_eval_general/.venv/bin/python`。shell/文档命令语法与 diff 检查通过；没有安装环境、启动训练或运行正式评测。
+
+### 9.9 2026-09-25 按有效 batch 校验训练并放开推理 batch
+
+- 保留用户配置的 train/validation batch32、gradient accumulation4。训练入口原本已按 world size × microbatch × accumulation = 128 校验，本次将入口测试中固定 accumulation32 的断言改为有效 batch128。
+- 推理取消 batch1 限制，默认仍为1，CLI 优先于 YAML；校验为正整数并保留单进程限制。实际 batch 继续写入 provenance，同目录改变 batch 仍拒绝混用预测。
+- 旧 checkpoint 的配置哈希、实际 batch/world size、optimizer 等严格恢复检查保持原样。4000/8000/12000/16000/19500 保存节点和 best/late 规则保持原样。
+- 8 项入口测试与 4 项训练契约测试通过，覆盖多种单卡/多卡 batch 拆分、错误有效 batch 拒绝、推理 batch32 入口放行、多进程拒绝、provenance、保存节点和 CPU 小模型 checkpoint 恢复。`git diff --check` 通过；未启动正式训练、模型推理或评测。

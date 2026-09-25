@@ -142,7 +142,7 @@ Git 不同步 `.venv`、权重缓存、benchmark 数据或共享评测器；另�
 
 ### aligned：当前主实验
 
-配置固定 seed 42、单 GPU microbatch 4 × 累计 32，得到有效 batch 128。训练共 19,500 optimizer updates，即 2,496,000 次样本暴露；验证与保存固定在 **4,000、8,000、12,000、16,000、19,500**。`best` 指向 validation 归一化有效 5D MSE 最低的 checkpoint，`late` 指向最新保存点，完成后为 `checkpoint-19500`；没有 `last` 别名。主比较使用完成后的 `late`，不能根据测试集挑选 checkpoint。
+配置固定 seed 42，当前单 GPU microbatch 32 × 累计 4，得到有效 batch 128。新运行可以调整两者，只要求 `GPU 数 × 每卡 microbatch × 累计步数 = 128`，各项均为正整数。当前 validation batch 为 32，可通过 `training.eval_batch_size` 调整。训练共 19,500 optimizer updates，即 2,496,000 次样本暴露；验证与保存固定在 **4,000、8,000、12,000、16,000、19,500**。`best` 指向 validation 归一化有效 5D MSE 最低的 checkpoint，`late` 指向最新保存点，完成后为 `checkpoint-19500`；没有 `last` 别名。主比较使用完成后的 `late`，不能根据测试集挑选 checkpoint。
 
 依次手动执行训练、推理、评测：
 
@@ -163,7 +163,9 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python train_seen10.py train \
   --resume-from-checkpoint latest
 ```
 
-恢复会核对保存的执行约定、optimizer、scheduler、随机数与采样进度；不能随意改变已有运行的进程数或 batch 划分。新运行使用多 GPU 时须保持 `GPU 数 × 每卡 microbatch × 累计步数 = 128`，并重新核对启动参数。正式测试推理固定 seed 42、单进程、batch 1 和 manifest 顺序；不要改用多进程或较大 batch 的加速命令。aligned 的部分预测文件不能按 ID 跳过后续跑，若推理中断，应使用新的结果目录从第一条重新推理，并在评测时指定同一目录。例如：
+恢复会核对保存的执行约定、optimizer、scheduler、随机数与采样进度；已有 checkpoint 仍须使用原配置和原 batch 划分，即使修改后的有效 batch 仍为 128，也不能绕过严格恢复检查。正式测试推理保持 seed 42、单进程和 manifest 顺序；batch 默认为 1，可通过 `inference.batch_size` 或 wrapper 的 `-- --batch-size 32` 指定任意正整数，不受训练有效 batch 128 的限制。实际 batch 会写入 provenance；不同 batch 可能改变随机采样与数值结果，不能根据 test 指标选择 batch。改变 batch 时使用新的结果目录，不能混用已有预测。
+
+aligned 的部分预测文件不能按 ID 跳过后续跑，若推理中断，应使用新的结果目录从第一条重新推理，并在评测时指定同一目录。例如：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_csgo_seen10.sh infer \

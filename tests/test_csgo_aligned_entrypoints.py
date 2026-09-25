@@ -1,14 +1,17 @@
 """Entry-point protocol, checkpoint selection and coordinate export checks."""
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
-from infer_seen10 import _checkpoint_path, _provenance
+from infer_seen10 import _checkpoint_path, _provenance, _resolve_batch_size, main as infer_main
 from scripts.export_unilip_seen_predictions import convert_row
-from train_seen10 import _native_argv, _resolved_paths, build_parser
+from train_seen10 import _native_argv, _resolved_paths, build_parser, main as train_main
 
 
 class EntryPointTests(unittest.TestCase):
@@ -21,9 +24,63 @@ class EntryPointTests(unittest.TestCase):
         args = _native_argv(config_path=path, checkpoint_dir=checkpoints, seed=42,
                             max_steps=19500, interval=4000, config=config, cli=cli, extra=[])
         for key, value in [('--checkpointing_period', '4000'), ('--max_train_steps', '19500'),
-                           ('--gradient_accumulation_steps', '32'), ('--lr_warmup_steps', '59')]:
+                           ('--lr_warmup_steps', '59')]:
             self.assertEqual(args[args.index(key)+1], value)
+        # This invocation is single-process. Only the product is prescribed;
+        # changing the microbatch/accumulation split must not break the test.
+        effective_batch = (int(args[args.index('--train_batch_size')+1])
+                           * int(args[args.index('--gradient_accumulation_steps')+1]))
+        self.assertEqual(effective_batch, 128)
         self.assertIn('--image_aug', args)
+
+    def test_training_accepts_any_split_with_effective_batch_128(self):
+        for world, microbatch, accumulation in ((1, 4, 32), (1, 32, 4), (1, 128, 1), (2, 16, 4)):
+            with self.subTest(world=world, microbatch=microbatch, accumulation=accumulation):
+                output = io.StringIO()
+                with patch.dict('os.environ', {'WORLD_SIZE': str(world)}), contextlib.redirect_stdout(output):
+                    result = train_main(['train', '--config', 'configs/csgo_seen10_aligned.yaml', '--dry-run',
+                                         '--train_batch_size', str(microbatch),
+                                         '--gradient_accumulation_steps', str(accumulation)])
+                self.assertEqual(result, 0)
+                resolved = json.loads(output.getvalue())['args']
+                self.assertEqual(world * resolved['train_batch_size'] * resolved['gradient_accumulation_steps'], 128)
+
+    def test_training_rejects_effective_batch_other_than_128(self):
+        for world, microbatch, accumulation in ((1, 32, 2), (2, 32, 4)):
+            with self.subTest(world=world, microbatch=microbatch, accumulation=accumulation):
+                with patch.dict('os.environ', {'WORLD_SIZE': str(world)}), \
+                        self.assertRaisesRegex(ValueError, 'effective batch must be 128'):
+                    train_main(['train', '--config', 'configs/csgo_seen10_aligned.yaml', '--dry-run',
+                                '--train_batch_size', str(microbatch),
+                                '--gradient_accumulation_steps', str(accumulation)])
+
+    def test_inference_batch_is_independent_of_training_budget(self):
+        config = {'training': {'train_batch_size': 32, 'gradient_accumulation_steps': 4, 'eval_batch_size': 32},
+                  'inference': {'batch_size': 1}}
+        self.assertEqual(_resolve_batch_size(config), 1)
+        for batch in (1, 4, 32, 128, 256):
+            with self.subTest(batch=batch):
+                self.assertEqual(_resolve_batch_size(config, batch), batch)
+                self.assertEqual(_resolve_batch_size({'inference': {'batch_size': batch}}), batch)
+        self.assertEqual(_resolve_batch_size({'training': {'eval_batch_size': 32}}), 32)
+        for batch in (0, -1, 1.5, True, 'bad'):
+            with self.subTest(invalid_batch=batch), self.assertRaisesRegex(ValueError, 'positive integer'):
+                _resolve_batch_size({'inference': {'batch_size': batch}})
+
+    def test_inference_entry_accepts_batch_32_but_still_rejects_multiple_processes(self):
+        # Stop at checkpoint lookup: exercise the real entry checks without
+        # loading weights, creating outputs, or running model inference.
+        command = ['infer', '--config', 'configs/csgo_seen10_aligned.yaml', '--batch-size', '32']
+        with patch.dict('os.environ', {'WORLD_SIZE': '1'}), \
+                patch('infer_seen10._checkpoint_path', side_effect=RuntimeError('checkpoint lookup reached')) as lookup, \
+                self.assertRaisesRegex(RuntimeError, 'checkpoint lookup reached'):
+            infer_main(command)
+        lookup.assert_called_once()
+        with patch.dict('os.environ', {'WORLD_SIZE': '2'}), \
+                patch('infer_seen10._checkpoint_path') as lookup, \
+                self.assertRaisesRegex(ValueError, 'single process'):
+            infer_main(command)
+        lookup.assert_not_called()
 
     def test_aligned_late_does_not_select_best(self):
         with tempfile.TemporaryDirectory() as temporary:
