@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from scripts.csgo_paths import data_root as resolve_data_root
+from scripts.csgo_paths import run_directories
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -78,19 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _resolved_paths(config: dict[str, Any], config_path: Path, cli: argparse.Namespace) -> tuple[Path, Path, Path]:
     project_root = PROJECT_ROOT
     data_root = resolve_data_root(config, cli.data_root, root=project_root)
-    output_root = config.get("output_root", "outputs/csgo_benchmark_v2_seen10")
-    checkpoint_root = config.get("checkpoint_root", "checkpoints/csgo_benchmark_v2_seen10")
-    model_name = str(config.get("model_name", "RDT"))
     seed = int(cli.seed if cli.seed is not None else config.get("seed", 0))
-    run_name = f"seed_{seed}"
-    if cli.output_dir is None:
-        output_dir = _path(output_root, project_root) / model_name / run_name
-    else:
-        output_dir = _path(cli.output_dir, project_root)
-    if cli.checkpoint_dir is None:
-        checkpoint_dir = _path(checkpoint_root, project_root) / model_name / run_name
-    else:
-        checkpoint_dir = _path(cli.checkpoint_dir, project_root)
+    output_dir, checkpoint_dir = run_directories(
+        config, seed=seed, smoke=cli.mode == "smoke", output=cli.output_dir,
+        checkpoint=cli.checkpoint_dir, root=project_root,
+    )
     return data_root, output_dir, checkpoint_dir
 
 
@@ -204,10 +197,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("config.training must be a mapping")
     max_steps = int(cli.max_train_steps if cli.max_train_steps is not None else training.get("max_train_steps", 5))
     if cli.mode == "smoke":
-        if cli.output_dir is None:
-            artifact_dir = artifact_dir.parent / "smoke" / artifact_dir.name
-        if cli.checkpoint_dir is None:
-            checkpoint_dir = checkpoint_dir.parent / "smoke" / checkpoint_dir.name
         max_steps = 5
     elif cli.train_limit_per_map is not None or cli.eval_limit_per_map is not None:
         raise ValueError("per-map limits are only allowed for smoke")
@@ -217,10 +206,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     interval = (int(training.get("checkpoint_interval_updates", 4000))
                 if aligned and cli.mode != "smoke" else max_steps // 5)
     resume = cli.resume_from_checkpoint is not None
-    if not cli.dry_run and not resume and _is_main_process() and (_occupied(artifact_dir) or _occupied(checkpoint_dir)):
-        raise FileExistsError(
-            f"Refusing to overwrite existing run; use a new --seed or --resume-from-checkpoint: {artifact_dir}"
-        )
+    if not cli.dry_run and not resume and _is_main_process():
+        occupied = [f"{label}={path}" for label, path in (
+            ("output_dir", artifact_dir), ("checkpoint_dir", checkpoint_dir),
+        ) if _occupied(path)]
+        if occupied:
+            raise FileExistsError(
+                "Refusing to overwrite existing run; non-empty run directories: "
+                + "; ".join(occupied)
+                + ". To start fresh, archive the previous run's output and checkpoint directories "
+                "or select unused --output-dir and --checkpoint-dir paths. "
+                "To continue a completed checkpoint, use --resume-from-checkpoint with the original configuration."
+            )
 
     native_argv = _native_argv(
         config_path=config_path,

@@ -12,10 +12,12 @@ legacy 与 aligned 的运行说明统一维护于本文；aligned 的验收记�
 
 本项目保留两套独立配置：
 
-| 实验 | 配置 | seed | checkpoint 目录 | 结果目录 | 主结果选择 |
+| 实验 | 配置 | seed | 新运行默认 checkpoint 目录 | 结果目录 | 主结果选择 |
 | --- | --- | ---: | --- | --- | --- |
-| 首次接入 legacy | `configs/csgo_seen10.yaml` | 0 | `checkpoints/csgo_benchmark_v2_seen10/RDT/seed_0` | `outputs/csgo_benchmark_v2_seen10/RDT/seed_0` | validation `best` |
-| 公平对比 aligned | `configs/csgo_seen10_aligned.yaml` | 42 | `checkpoints/csgo_aligned_aug_v1/RDT/seed_42` | `outputs/csgo_aligned_aug_v1/RDT/seed_42` | 完成后的 `late` |
+| 首次接入 legacy | `configs/csgo_seen10.yaml` | 0 | `outputs/csgo_benchmark_v2_seen10/RDT/seed_0/checkpoints` | `outputs/csgo_benchmark_v2_seen10/RDT/seed_0` | validation `best` |
+| 公平对比 aligned | `configs/csgo_seen10_aligned.yaml` | 42 | `outputs/csgo_aligned_aug_v1/RDT/seed_42/checkpoints` | `outputs/csgo_aligned_aug_v1/RDT/seed_42` | 完成后的 `late` |
+
+两份当前 YAML 均设 `checkpoint_root: null`，表示默认 `checkpoint_dir = <实际 output_dir>/checkpoints`。因此自定义 `--output-dir` 时，训练、推理、smoke 和 wrapper 的默认 checkpoint 目录会一起移动；显式 `--checkpoint-dir` 优先级最高，直接推理入口对应 `--checkpoint`。旧 YAML 若显式设置 `checkpoint_root`，仍使用 `<checkpoint_root>/<model>/<seed>`；缺少该字段的旧配置继续使用原来的默认 checkpoint root，避免改变旧配置的默认解析及哈希。现有 legacy `seed_0` 的历史 checkpoint 仍在 `checkpoints/csgo_benchmark_v2_seen10/RDT/seed_0`，不会自动迁移。
 
 legacy 保留最初接入的 1,000 updates、有效 batch 4、只监督 5D 的 clean-action loss、无图像增强，以及推理各步对无效 action 维度的旧处理。aligned 使用有效 batch 128、19,500 updates 和完整 128D 原生扩散训练与五步 DPM-Solver 推理；5D pose 后的 123 维零目标仍进入完整 128D 加噪及主 loss，最后才裁剪为 5D 预测。结构性的全零 state 槽位仍参与计算，不代表额外输入状态。aligned 冻结 SigLIP-384 和 T5，训练 RDT LoRA 及适配层，共 73,164,928 个可训练参数；仅训练图像按视角独立以 0.5 概率启用原生颜色、噪声与模糊增强。两套设置的目标函数和训练量不同，旧结果只能作为首次接入的历史结果。
 
@@ -99,7 +101,7 @@ bash scripts/run_csgo_seen10.sh eval \
 
 查看输出的 `evaluator_python`（保留的别名字段 `unilip_python` 值相同）。训练、训练内 validation 和测试集推理继续使用 RDT 环境；通用评测器的依赖与安装清单由评测器项目维护。
 
-**旧训练恢复兼容性：** aligned checkpoint 校验完整配置哈希，本次把 YAML 的评测环境字段改为 null 也会改变该哈希。已开始的旧运行恢复时应使用启动时的原配置；评测可在原配置基础上用 `--eval-python` 或 `CSGO_EVAL_PYTHON` 指定统一环境，无需改动原训练配置。没有放宽恢复检查或改写历史产物。
+**旧训练恢复兼容性：** aligned checkpoint 校验完整配置哈希；把 YAML 的评测环境字段或 `checkpoint_root` 改为 null 都会改变该哈希。已开始的旧运行恢复时须使用启动时的原 YAML，并通过原配置中的显式 `checkpoint_root` 或 CLI `--checkpoint-dir` 指向旧 checkpoint 目录；旧 checkpoint 不会自动迁移。评测可在原配置基础上用 `--eval-python` 或 `CSGO_EVAL_PYTHON` 指定统一环境，无需改动原训练配置。没有放宽恢复检查或改写历史产物。
 
 ### 两台服务器的路径配置
 
@@ -163,6 +165,8 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python train_seen10.py train \
   --resume-from-checkpoint latest
 ```
 
+若失败后需要从 base 重新开始，入口会检查实际输出目录和 checkpoint 目录是否非空。新默认下 checkpoint、语言缓存和运行元数据均在 `outputs/csgo_aligned_aug_v1/RDT/seed_42` 内；确认旧训练进程已退出后，归档整个运行目录即可。旧配置使用分离的 checkpoint root 时，须同时检查并归档 outputs 与旧 checkpoint 运行目录；只清理 outputs 不够。不要为绕过防覆盖检查改变 aligned 的 seed，也不要将只有初始化文件的目录当成可恢复 checkpoint。错误信息会列出实际非空的目录。
+
 恢复会核对保存的执行约定、optimizer、scheduler、随机数与采样进度；已有 checkpoint 仍须使用原配置和原 batch 划分，即使修改后的有效 batch 仍为 128，也不能绕过严格恢复检查。正式测试推理保持 seed 42、单进程和 manifest 顺序；batch 默认为 1，可通过 `inference.batch_size` 或 wrapper 的 `-- --batch-size 32` 指定任意正整数，不受训练有效 batch 128 的限制。实际 batch 会写入 provenance；不同 batch 可能改变随机采样与数值结果，不能根据 test 指标选择 batch。改变 batch 时使用新的结果目录，不能混用已有预测。
 
 aligned 的部分预测文件不能按 ID 跳过后续跑，若推理中断，应使用新的结果目录从第一条重新推理，并在评测时指定同一目录。例如：
@@ -170,6 +174,7 @@ aligned 的部分预测文件不能按 ID 跳过后续跑，若推理中断，�
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_csgo_seen10.sh infer \
   --config configs/csgo_seen10_aligned.yaml \
+  --checkpoint-dir outputs/csgo_aligned_aug_v1/RDT/seed_42/checkpoints \
   --output-dir outputs/csgo_aligned_aug_v1/RDT/seed_42_infer_rerun
 bash scripts/run_csgo_seen10.sh eval \
   --config configs/csgo_seen10_aligned.yaml \
@@ -199,15 +204,16 @@ legacy 默认推理取 validation `best`，默认 batch 来自配置的 `trainin
   --output outputs/csgo_benchmark_v2_seen10/RDT/seed_0/evaluation/localization_recheck
 ```
 
-共享评测器拒绝写入已有非空结果目录；重复评测时更换上述 `--output`。legacy 和 aligned 的输出根目录分别由各自 YAML 决定；自定义目录时，训练所用 `--checkpoint-dir`、`--output-dir` 要在后续推理中保持一致，评测使用相同 `--output-dir`。wrapper 的模式名必须放在第一位，`--config`、`--seed`、`--checkpoint-dir`、`--output-dir` 等公共参数放在模式名之后、`--` 之前；训练和推理的额外参数在 `--` 后传入。
+共享评测器拒绝写入已有非空结果目录；重复评测时更换上述 `--output`。legacy 和 aligned 的输出根目录分别由各自 YAML 决定；训练与推理使用同一 `--output-dir` 时，null 模式会自动选中同一 checkpoint 目录。若仅为重新推理而更换 `--output-dir`，须同时用 `--checkpoint-dir` 指向原训练目录下的 `checkpoints`（直接调用 `infer_seen10.py` 时用 `--checkpoint`）；评测使用新的推理 `--output-dir`。旧分离布局或显式自定义 checkpoint 目录也须在推理时指定原路径。wrapper 的模式名必须放在第一位，`--config`、`--seed`、`--checkpoint-dir`、`--output-dir` 等公共参数放在模式名之后、`--` 之前；训练和推理的额外参数在 `--` 后传入。
 
 ## 4. 输出、可视化与指标
 
-每个正式 seed 的 checkpoint 根目录下保存 `checkpoint-<step>` 和 `best`/`late` 相对符号链接；aligned 只保存上述五个正式节点。对应结果目录包含：
+新默认下，每个正式 seed 的 `output_dir/checkpoints` 保存 `checkpoint-<step>` 和 `best`/`late` 相对符号链接；aligned 的默认路径为 `outputs/csgo_aligned_aug_v1/RDT/seed_42/checkpoints`，只保存上述五个正式节点及链接，语言缓存等 checkpoint 运行文件也在该目录。对应结果目录包含：
 
 ```text
 training_metadata.json                 训练配置与完成状态
 train_loss.jsonl、loss_curve.svg       逐 update loss 与曲线
+checkpoints/                           checkpoint-4000、...、checkpoint-19500、best、late 等
 validation/step-<step>/               validation 预测、指标与地图可视化
 localization/predictions.jsonl         测试集归一化 5D 预测
 localization/inference_provenance.json 推理 checkpoint、seed 等来源信息

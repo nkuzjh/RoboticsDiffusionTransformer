@@ -16,7 +16,7 @@ pretrained_text_encoder_name_or_path: .cache/csgo_seen10/models/t5-v1_1-xxl
 pretrained_vision_encoder_name_or_path: .cache/csgo_seen10/models/siglip-so400m-patch14-384
 
 output_root: outputs/csgo_benchmark_v2_seen10
-checkpoint_root: checkpoints/csgo_benchmark_v2_seen10
+checkpoint_root: null  # Store checkpoints under <output_dir>/checkpoints.
 
 common:
   img_history_size: 1

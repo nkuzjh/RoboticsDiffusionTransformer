@@ -15,12 +15,34 @@ from train_seen10 import _native_argv, _resolved_paths, build_parser, main as tr
 
 
 class EntryPointTests(unittest.TestCase):
+    def test_overwrite_error_identifies_actual_nonempty_directories(self):
+        for populated in (('checkpoint_dir',), ('output_dir',), ('output_dir', 'checkpoint_dir')):
+            with self.subTest(populated=populated), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths = {'output_dir': root/'outputs', 'checkpoint_dir': root/'checkpoints'}
+                for label, path in paths.items():
+                    path.mkdir()
+                    if label in populated:
+                        (path/'run_metadata.json').write_text('{}')
+                with patch('train_seen10._is_main_process', return_value=True), \
+                        patch('train_seen10._native_argv') as native, \
+                        self.assertRaises(FileExistsError) as raised:
+                    train_main(['train', '--config', 'configs/csgo_seen10_aligned.yaml',
+                                '--output-dir', str(paths['output_dir']),
+                                '--checkpoint-dir', str(paths['checkpoint_dir'])])
+                native.assert_not_called()
+                message = str(raised.exception)
+                for label, path in paths.items():
+                    self.assertEqual(f'{label}={path}' in message, label in populated)
+                self.assertNotIn('new --seed', message)
+
     def test_profile_paths_and_native_invocation(self):
         path = Path('configs/csgo_seen10_aligned.yaml').resolve()
         config = yaml.safe_load(path.read_text())
         cli = build_parser().parse_args(['train', '--config', str(path)])
         _, artifacts, checkpoints = _resolved_paths(config, path, cli)
         self.assertTrue(str(artifacts).endswith('csgo_aligned_aug_v1/RDT/seed_42'))
+        self.assertEqual(checkpoints, artifacts/'checkpoints')
         args = _native_argv(config_path=path, checkpoint_dir=checkpoints, seed=42,
                             max_steps=19500, interval=4000, config=config, cli=cli, extra=[])
         for key, value in [('--checkpointing_period', '4000'), ('--max_train_steps', '19500'),

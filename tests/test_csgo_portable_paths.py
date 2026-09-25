@@ -10,12 +10,62 @@ from unittest.mock import patch
 
 from scripts.csgo_paths import (
     LEGACY_DATA, LEGACY_EVAL, LEGACY_PYTHON,
-    data_root, evaluator_root, evaluator_python,
+    data_root, evaluator_root, evaluator_python, run_directories,
 )
 from train_seen10 import _resolved_paths, build_parser
+from infer_seen10 import _run_paths, build_parser as infer_parser
 
 
 class PortablePathTests(unittest.TestCase):
+    def test_checkpoint_layout_preserves_old_configs_and_explicit_overrides(self):
+        root = Path('/relocated RDT')
+        for smoke in (False, True):
+            parts = ('RDT', 'smoke', 'seed_42') if smoke else ('RDT', 'seed_42')
+            for options, checkpoint_root in (({}, 'checkpoints/csgo_benchmark_v2_seen10'),
+                                             ({'checkpoint_root': 'old_checkpoints'}, 'old_checkpoints')):
+                artifacts, checkpoints = run_directories(options, seed=42, smoke=smoke, root=root)
+                self.assertEqual(checkpoints, root.joinpath(checkpoint_root, *parts))
+            config = {'checkpoint_root': None}
+            artifacts, checkpoints = run_directories(config, seed=42, smoke=smoke, root=root)
+            self.assertEqual(checkpoints, artifacts/'checkpoints')
+            artifacts, checkpoints = run_directories(config, seed=42, smoke=smoke,
+                                                     output='custom output', root=root)
+            self.assertEqual(artifacts, root/'custom output')
+            self.assertEqual(checkpoints, artifacts/'checkpoints')
+            _, checkpoints = run_directories(config, seed=42, smoke=smoke, output='custom output',
+                                              checkpoint='original checkpoint', root=root)
+            self.assertEqual(checkpoints, root/'original checkpoint')
+
+    def test_current_profile_layout_agrees_between_python_and_shell(self):
+        import yaml
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix='rdt layouts ') as temporary:
+            directory = Path(temporary)
+            for name in ('csgo_seen10.yaml', 'csgo_seen10_aligned.yaml'):
+                config_path = root/'configs'/name
+                config = yaml.safe_load(config_path.read_text())
+                self.assertIsNone(config['checkpoint_root'])
+                for smoke in (False, True):
+                    for custom in (False, True):
+                        with self.subTest(profile=name, smoke=smoke, custom=custom):
+                            extra = ['--output-dir', str(directory/'custom output')] if custom else []
+                            train_cli = build_parser().parse_args(
+                                ['smoke' if smoke else 'train', '--config', str(config_path)] + extra)
+                            infer_cli = infer_parser().parse_args(
+                                ['smoke' if smoke else 'infer', '--config', str(config_path)] + extra)
+                            train_paths = _resolved_paths(config, config_path, train_cli)
+                            infer_paths = _run_paths(config, config_path, infer_cli)
+                            self.assertEqual(train_paths, infer_paths)
+                            self.assertEqual(train_paths[2], train_paths[1]/'checkpoints')
+                            result = subprocess.run(
+                                ['bash', str(root/'scripts/run_csgo_seen10.sh'), train_cli.mode,
+                                 '--config', str(config_path), '--python', sys.executable, '--print-paths'] + extra,
+                                cwd=directory, text=True, capture_output=True, check=True)
+                            paths = json.loads(result.stdout)
+                            self.assertEqual(Path(paths['output_dir']), train_paths[1])
+                            self.assertEqual(Path(paths['checkpoint_dir']), train_paths[2])
+            self.assertFalse((directory/'custom output').exists())
+
     def test_original_machine_keeps_existing_yaml_paths(self):
         config = dict(data_root=LEGACY_DATA, shared_eval_dir=LEGACY_EVAL, unilip_python=LEGACY_PYTHON)
         with patch.object(Path, "exists", return_value=True):

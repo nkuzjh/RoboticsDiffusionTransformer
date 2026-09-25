@@ -158,7 +158,7 @@ scheduler仅随成功optimizer update推进一次，不按microbatch/world size�
 | 训练结束 | **19,500** |
 
 **最终策略：每4000 updates验证/保存，末尾19500补做一次，不再使用3900间隔。**
-目录为`checkpoint-<step>`。`late`链接到最近保存的step，完成后为`checkpoint-19500`；
+两份当前实验 YAML 设置 `checkpoint_root: null`，默认 checkpoint 目录为 `<实际 output_dir>/checkpoints`；aligned seed42 即 `outputs/csgo_aligned_aug_v1/RDT/seed_42/checkpoints`。`--checkpoint-dir` 显式覆盖该目录，直接推理入口对应 `--checkpoint`；自定义 `--output-dir` 时，训练、推理、smoke 与 wrapper 的 null 默认目录一起移动。目录内保存 `checkpoint-<step>`、`best`、`late`、语言缓存及运行文件。`late`链接到最近保存的step，完成后为`checkpoint-19500`；
 `best`链接到五个候选中validation normalized valid5 MSE最低者。RDT不另设`last`别名。
 主比较用final/late，best-val仅为标注清楚的附加结果；历史UniLIP每2000步保存，不能声称旧运行搜索密度相同。
 
@@ -172,13 +172,14 @@ smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 
 同实验的完整恢复校验YAML、实际batch/world size、资产、manifest、语言embedding哈希和optimizer设置。
 新运行更改GPU数仍须保持batch128；旧checkpoint保持严格恢复检查，改变配置或rank/microbatch/accumulation即使仍满足batch128也不能绕过检查。
+旧 YAML 显式设置 `checkpoint_root` 时继续解析为 `<checkpoint_root>/<model>/<seed>`；缺少该字段时保留原默认 root，不改变旧配置的解析和哈希。恢复既有 checkpoint 须使用原 YAML 通过严格哈希校验，并显式指定旧目录或沿用原配置的 root；已有产物不会自动移动。新默认若从 base 重启，归档整个 output 运行目录即可；旧分离布局仍须同时检查并归档 output 与 checkpoint 两处目录。
 
 ## 7. 配置与文件级实现边界
 
 | 文件/对象 | 职责 |
 | --- | --- |
-| configs/csgo_seen10.yaml | 保留legacy默认行为 |
-| configs/csgo_seen10_aligned.yaml | 显式aligned profile、增强、LoRA、预算、保存节点和推理协议 |
+| configs/csgo_seen10.yaml | 保留legacy训练协议；当前新运行的 checkpoint 默认收在 output 运行目录内 |
+| configs/csgo_seen10_aligned.yaml | 显式aligned profile、增强、LoRA、预算、保存节点和推理协议；checkpoint 默认收在 output 运行目录内 |
 | data/csgo_seen10.py：Seen10Dataset/collate_seen10 | 发布数据、身份与归一化、双视图；aligned外部5D，legacy128D；metadata不进入模型条件 |
 | data/csgo_augmentation.py | 原生增强、局部RNG、操作白名单、标签不变约束 |
 | data/csgo_update_sampler.py：AlignedUpdateSampler | global128/update、rank/microbatch分配、出现编号、恢复 |
@@ -189,13 +190,14 @@ smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 | train/csgo_aligned.py | update/optimizer/scheduler、协议约束、五次保存验证、完整恢复和审计 |
 | train_seen10.py | CLI/YAML解析、原始参数记录、预算/节点校验、dry-run与smoke边界 |
 | infer_seen10.py | aligned默认late、seed42/单进程、可配置正整数batch（默认1）、求解器provenance、标准预测和coverage |
-| scripts/run_csgo_seen10.sh | 所选YAML决定默认seed/输出目录；eval调用共享原evaluator |
-| scripts/csgo_paths.py | 跨服务器数据/评测目录解析；评测解释器按 OpenVLA 优先级选择，默认使用统一 evaluator 环境 |
+| scripts/run_csgo_seen10.sh | 所选YAML决定默认seed/输出目录；null checkpoint root 跟随实际 output 目录；eval调用共享原evaluator |
+| scripts/csgo_paths.py | 统一训练/推理/wrapper 的运行与 checkpoint 目录；跨服务器数据/评测目录解析；评测解释器按 OpenVLA 优先级选择，默认使用统一 evaluator 环境 |
 | scripts/setup_csgo_seen10.sh | 创建或复用项目环境，检查依赖；不要求另一项目的环境存在 |
 | train/csgo_visualize.py | 固定种子按地图取样；GT只供后处理 |
 | scripts/export_unilip_seen_predictions.py | Z epsilon及预测格式转换，不修改evaluator |
 
 数据/评测目录按显式CLI、环境变量、YAML的顺序解析；原机器默认目录不可用时回退到同级数据/评测目录，自定义路径不自动替换。评测 Python 按 `--eval-python`（兼容 `--unilip-python`）→ `CSGO_EVAL_PYTHON` → `UNILIP_PYTHON` → YAML `unilip_python` → `<shared_eval_dir>/.venv/bin/python` 选择；不探测、不自动安装、不回退到模型环境。当前两份 YAML 的 `unilip_python: null` 启用统一默认；旧 YAML 的显式解释器仍保留。训练与推理的数据路径共用解析器；没有改写已保存协议或放宽恢复校验。
+checkpoint 路径按显式 CLI → YAML `checkpoint_root` → 旧配置缺字段时的原默认值解析。YAML 为 null 时从实际 `output_dir` 推导 `checkpoints` 子目录；非 null 时沿用分离的 root/model/seed 路径。训练、推理、smoke 和 wrapper 使用相同规则；只更换推理输出目录时，须显式传入原训练 checkpoint 目录。
 显式CLI seed等覆盖YAML默认；YAML training映射为native参数后，透传参数最后解析。
 aligned随后校验最终运行值，违反固定协议的覆盖报错，不能只凭YAML认定实际值。
 审计记录raw_config、原始CLI/native argv、resolved_args、optimizer实际组和checkpoint状态。
@@ -365,3 +367,9 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - 推理取消 batch1 限制，默认仍为1，CLI 优先于 YAML；校验为正整数并保留单进程限制。实际 batch 继续写入 provenance，同目录改变 batch 仍拒绝混用预测。
 - 旧 checkpoint 的配置哈希、实际 batch/world size、optimizer 等严格恢复检查保持原样。4000/8000/12000/16000/19500 保存节点和 best/late 规则保持原样。
 - 8 项入口测试与 4 项训练契约测试通过，覆盖多种单卡/多卡 batch 拆分、错误有效 batch 拒绝、推理 batch32 入口放行、多进程拒绝、provenance、保存节点和 CPU 小模型 checkpoint 恢复。`git diff --check` 通过；未启动正式训练、模型推理或评测。
+
+### 9.10 2026-09-25 checkpoint 收入 outputs 运行目录
+
+- 当前 legacy/aligned YAML 与新建 tiny fixture 使用 `checkpoint_root: null`，统一由 `scripts.csgo_paths.run_directories` 解析为实际 output 目录下的 `checkpoints`。训练、推理和 shell wrapper 共用解析器，smoke 只添加一次隔离目录。旧 YAML 的显式 root、缺字段默认和 CLI 覆盖继续兼容。
+- 防覆盖错误列出实际非空的 output/checkpoint 目录；不再误导用户只清理 outputs 或通过更换 aligned seed 绕过检查。没有自动迁移、删除已有产物，也没有放宽旧 checkpoint 恢复契约。
+- 11 项路径测试与 27 项 aligned 数据、入口、模型和训练契约测试通过；覆盖两份配置的训练/推理/wrapper 一致性、自定义输出目录、smoke、旧配置与显式覆盖，以及五个保存节点、best/late 和小模型 checkpoint 往返。shell 语法、路径打印和 `git diff --check` 通过；未启动正式训练、推理或评测。

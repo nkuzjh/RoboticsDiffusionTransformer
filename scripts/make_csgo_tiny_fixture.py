@@ -179,7 +179,7 @@ def _tiny_config(
         "pretrained_text_encoder_name_or_path": _project_path(t5),
         "pretrained_vision_encoder_name_or_path": _project_path(siglip),
         "output_root": "outputs/csgo_benchmark_v2_seen10",
-        "checkpoint_root": "checkpoints/csgo_benchmark_v2_seen10",
+        "checkpoint_root": None,
         "common": {
             "img_history_size": 1,
             "action_chunk_size": 1,

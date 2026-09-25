@@ -117,21 +117,19 @@ fi
 
 # Resolve defaults from the chosen profile; never replace aligned paths with
 # legacy seed_0 defaults. Explicit CLI/environment paths still win.
-resolved="$("$PYTHON" - "$CONFIG" "$SEED" "$MODE" "$DATA_ROOT" "$EVAL_ROOT" "$EVAL_PYTHON_EXPLICIT" <<'PY'
+resolved="$("$PYTHON" - "$CONFIG" "$SEED" "$MODE" "$DATA_ROOT" "$EVAL_ROOT" "$EVAL_PYTHON_EXPLICIT" "$OUTPUT_DIR" "$CHECKPOINT_DIR" <<'PY'
 import sys
 from pathlib import Path
 import yaml
-from scripts.csgo_paths import data_root, evaluator_root, evaluator_python
+from scripts.csgo_paths import data_root, evaluator_root, evaluator_python, run_directories
 c = yaml.safe_load(Path(sys.argv[1]).read_text())
 seed = int(sys.argv[2]) if sys.argv[2] else int(c.get('seed', 0))
-parts = [str(c.get('model_name', 'RDT'))]
-if sys.argv[3] == 'smoke':
-    parts.append('smoke')
-parts.append(f'seed_{seed}')
+artifacts, checkpoints = run_directories(c, seed=seed, smoke=sys.argv[3] == 'smoke',
+                                        output=sys.argv[7] or None, checkpoint=sys.argv[8] or None)
 print(seed)
 print(data_root(c, sys.argv[4] or None))
-print(Path(c.get('output_root', 'outputs/csgo_benchmark_v2_seen10')).joinpath(*parts))
-print(Path(c.get('checkpoint_root', 'checkpoints/csgo_benchmark_v2_seen10')).joinpath(*parts))
+print(artifacts)
+print(checkpoints)
 selected_eval_root = evaluator_root(c, sys.argv[5] or None)
 print(selected_eval_root)
 print(evaluator_python(c, sys.argv[6] or None, eval_root=selected_eval_root))
@@ -140,8 +138,8 @@ PY
 mapfile -t profile_paths <<< "$resolved"
 SEED="${profile_paths[0]}"
 DATA_ROOT="${profile_paths[1]}"
-OUTPUT_DIR="${OUTPUT_DIR:-${profile_paths[2]}}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${profile_paths[3]}}"
+OUTPUT_DIR="${profile_paths[2]}"
+CHECKPOINT_DIR="${profile_paths[3]}"
 EVAL_ROOT="${profile_paths[4]}"
 UNILIP_PYTHON="${profile_paths[5]}"
 

@@ -22,6 +22,30 @@ def _path(value: object, root: Path) -> Path:
     return candidate if candidate.is_absolute() else root / candidate
 
 
+def run_directories(config: Mapping, *, seed: int, smoke: bool = False,
+                    output: object = None, checkpoint: object = None,
+                    root: Path = PROJECT_ROOT) -> tuple[Path, Path]:
+    """Resolve both entrypoints and the shell wrapper with the same layout.
+
+    Explicit null checkpoint_root opts into <output>/checkpoints. Old YAML
+    without this key keeps its original default, including for strict resume.
+    """
+    parts = [str(config.get("model_name", "RDT"))]
+    if smoke:
+        parts.append("smoke")
+    parts.append(f"seed_{seed}")
+    artifacts = (_path(output, root) if output is not None else
+                 _path(config.get("output_root", "outputs/csgo_benchmark_v2_seen10"), root).joinpath(*parts))
+    checkpoint_root = config.get("checkpoint_root", "checkpoints/csgo_benchmark_v2_seen10")
+    if checkpoint is not None:
+        checkpoints = _path(checkpoint, root)
+    elif checkpoint_root is None:
+        checkpoints = artifacts / "checkpoints"
+    else:
+        checkpoints = _path(checkpoint_root, root).joinpath(*parts)
+    return artifacts, checkpoints
+
+
 def _resolve(config: Mapping, key: str, explicit: object, env_names: tuple[str, ...],
              legacy: str, fallback: Path, root: Path, env: Mapping[str, str]) -> Path:
     if explicit is not None:

@@ -24,6 +24,7 @@ from models.multimodal_encoder.siglip_encoder import SiglipVisionTower
 from train.csgo_hooks import prepare_csgo_batch
 from train.csgo_visualize import render_localization
 from scripts.csgo_paths import data_root as resolve_data_root
+from scripts.csgo_paths import run_directories
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -96,22 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_paths(config: Mapping[str, Any], config_path: Path, cli: argparse.Namespace) -> tuple[Path, Path, Path]:
     project_root = PROJECT_ROOT
-    model_name = str(config.get("model_name", "RDT"))
     seed = int(cli.seed if cli.seed is not None else config.get("seed", 0))
-    output_root = config.get("output_root", "outputs/csgo_benchmark_v2_seen10")
-    checkpoint_root = config.get("checkpoint_root", "checkpoints/csgo_benchmark_v2_seen10")
-    if cli.output_dir is None:
-        output_dir = _path(output_root, project_root) / model_name / f"seed_{seed}"
-        if cli.mode == "smoke":
-            output_dir = output_dir.parent / "smoke" / output_dir.name
-    else:
-        output_dir = _path(cli.output_dir, project_root)
-    if cli.checkpoint is None:
-        checkpoint_dir = _path(checkpoint_root, project_root) / model_name / f"seed_{seed}"
-        if cli.mode == "smoke":
-            checkpoint_dir = checkpoint_dir.parent / "smoke" / checkpoint_dir.name
-    else:
-        checkpoint_dir = _path(cli.checkpoint, project_root)
+    output_dir, checkpoint_dir = run_directories(
+        config, seed=seed, smoke=cli.mode == "smoke", output=cli.output_dir,
+        checkpoint=cli.checkpoint, root=project_root,
+    )
     data_root = resolve_data_root(config, cli.data_root, root=project_root)
     return data_root, output_dir, checkpoint_dir
 
