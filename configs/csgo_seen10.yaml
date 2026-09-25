@@ -9,7 +9,7 @@ task: localization
 seed: 0
 data_root: /home/jiahao/task/UniLIP/data/csgo_benchmark_v2
 shared_eval_dir: /home/jiahao/task/csgo_benchmark_v2_eval_general
-unilip_python: /home/jiahao/miniconda3/envs/UniLIP/bin/python
+unilip_python: null  # Default: <shared_eval_dir>/.venv/bin/python
 
 pretrained_model_name_or_path: .cache/csgo_seen10/models/rdt-1b
 pretrained_text_encoder_name_or_path: .cache/csgo_seen10/models/t5-v1_1-xxl

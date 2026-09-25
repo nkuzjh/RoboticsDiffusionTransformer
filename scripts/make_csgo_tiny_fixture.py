@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if os.fspath(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(PROJECT_ROOT))
 DEFAULT_OUTPUT = PROJECT_ROOT / ".cache" / "csgo_seen10" / "tiny_fixture"
-from scripts.csgo_paths import data_root, evaluator_root, evaluator_python
+from scripts.csgo_paths import data_root, evaluator_root
 
 DEFAULT_DATA_ROOT = data_root({})
 DEFAULT_SHARED_EVAL = evaluator_root({})
@@ -174,7 +174,7 @@ def _tiny_config(
         "seed": 0,
         "data_root": os.fspath(data_root.expanduser().resolve()),
         "shared_eval_dir": os.fspath(shared_eval_dir.expanduser().resolve()),
-        "unilip_python": str(evaluator_python({}, python=sys.executable)),
+        "unilip_python": None,
         "pretrained_model_name_or_path": _project_path(rdt),
         "pretrained_text_encoder_name_or_path": _project_path(t5),
         "pretrained_vision_encoder_name_or_path": _project_path(siglip),

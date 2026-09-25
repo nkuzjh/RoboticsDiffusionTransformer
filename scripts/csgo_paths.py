@@ -1,7 +1,7 @@
 """Machine-local paths for Seen-10 without rewriting experiment YAML files.
 
-CLI > environment > YAML. Only the original machine-specific defaults are
-relocated when unavailable; arbitrary user-configured paths are never replaced.
+CLI > environment > YAML. Only original data/evaluator directory defaults are
+relocated when unavailable; explicit Python paths are never replaced.
 Relative paths are rooted at the RDT checkout, independent of the caller's cwd.
 """
 from __future__ import annotations
@@ -52,7 +52,21 @@ def evaluator_root(config: Mapping, explicit: object = None, *, root: Path = PRO
 
 
 def evaluator_python(config: Mapping, explicit: object = None, *, root: Path = PROJECT_ROOT,
-                     env: Mapping[str, str] | None = None, python: object = None) -> Path:
-    return _resolve(config, "unilip_python", explicit, ("UNILIP_PYTHON",),
-                    LEGACY_PYTHON, _path(python, root) if python else root / ".venv/bin/python",
-                    root, os.environ if env is None else env)
+                     env: Mapping[str, str] | None = None, eval_root: object = None,
+                     python: object = None) -> Path:
+    """Select the shared evaluator's interpreter without probing or repairing it.
+
+    ``python`` is a deprecated compatibility argument; the RDT interpreter is
+    never an implicit evaluator fallback. Keep virtualenv symlinks intact.
+    """
+    environment = os.environ if env is None else env
+    if explicit is not None:
+        return _path(explicit, root)
+    for name in ("CSGO_EVAL_PYTHON", "UNILIP_PYTHON"):
+        if environment.get(name):
+            return _path(environment[name], root)
+    if config.get("unilip_python"):
+        return _path(config["unilip_python"], root)
+    selected_eval_root = (_path(eval_root, root) if eval_root is not None else
+                          evaluator_root(config, root=root, env=environment))
+    return selected_eval_root / ".venv/bin/python"

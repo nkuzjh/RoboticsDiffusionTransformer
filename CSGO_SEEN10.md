@@ -70,6 +70,37 @@ T5 tokenizer 还需要 `sentencepiece` 和 `protobuf`（导入名为 `google.pro
 
 当前服务器已有 PyTorch nightly 环境会保留，新服务器默认采用上述稳定版，因此不承诺两台机器的浮点结果逐位一致；实验报告应保留各自 `--check` 输出及推理 provenance 中的依赖版本。
 
+### 通用评测器的独立环境
+
+RDT 与 OpenVLA 使用相同的评测解释器优先级：
+
+```text
+--eval-python（兼容 --unilip-python）
+  > CSGO_EVAL_PYTHON
+  > UNILIP_PYTHON
+  > YAML unilip_python
+  > <实际 shared_eval_dir>/.venv/bin/python
+```
+
+两份当前实验 YAML 均设 `unilip_python: null`，默认使用通用评测器自己的环境。`--eval-root` 或 `SHARED_EVAL_DIR` 改变评测器目录时，默认解释器随之改变。`--python` 仍指定 RDT 的启动解释器，不覆盖评测环境。显式 Python 路径不做存在性探测或回退；未安装时直接启动失败。RDT 的 eval 不安装、检查或修复评测环境。
+
+同步完整评测器目录后，定位任务可单独初始化一次环境，跳过生成指标权重下载：
+
+```bash
+cd ~/task/csgo_benchmark_v2_eval_general
+bash setup_env.sh --skip-weights
+cd ~/task/RoboticsDiffusionTransformer
+
+# 取消此前指向 RDT/UniLIP 的覆盖，使用统一默认环境
+unset CSGO_EVAL_PYTHON UNILIP_PYTHON
+bash scripts/run_csgo_seen10.sh eval \
+  --config configs/csgo_seen10_aligned.yaml --print-paths
+```
+
+查看输出的 `evaluator_python`（保留的别名字段 `unilip_python` 值相同）。训练、训练内 validation 和测试集推理继续使用 RDT 环境；通用评测器的依赖与安装清单由评测器项目维护。
+
+**旧训练恢复兼容性：** aligned checkpoint 校验完整配置哈希，本次把 YAML 的评测环境字段改为 null 也会改变该哈希。已开始的旧运行恢复时应使用启动时的原配置；评测可在原配置基础上用 `--eval-python` 或 `CSGO_EVAL_PYTHON` 指定统一环境，无需改动原训练配置。没有放宽恢复检查或改写历史产物。
+
 ### 两台服务器的路径配置
 
 推荐在两台服务器均使用同级目录布局：
@@ -81,17 +112,17 @@ task/
   csgo_benchmark_v2_eval_general/run_eval.py
 ```
 
-解析顺序为显式 CLI → 环境变量 → YAML。原 YAML 中本机的默认路径仍存在时沿用；若这些旧默认路径在另一台服务器不存在，自动使用上述同级目录，评测 Python 回退到 RDT `.venv/bin/python`。自定义的错误路径不会被静默替换。共享定位评测不要求单独安装名为 UniLIP 的环境。
+数据和评测器目录按显式 CLI → 环境变量 → YAML 解析。原 YAML 中本机的默认数据/评测器目录仍存在时沿用；若这些旧默认目录在另一台服务器不存在，自动使用上述同级目录。自定义的错误路径不会被静默替换。评测 Python 独立遵循上一节的优先级，旧 YAML 显式指定的 UniLIP 路径也不会自动回退。
 
 若实际布局不同，在当前 shell 设置以下变量；训练、推理及 wrapper 评测会使用相同数据路径：
 
 ```bash
 export CSGO_DATA_ROOT=/actual/path/to/csgo_benchmark_v2
 export SHARED_EVAL_DIR=/actual/path/to/csgo_benchmark_v2_eval_general
-export UNILIP_PYTHON="$PWD/.venv/bin/python"
+export CSGO_EVAL_PYTHON="$SHARED_EVAL_DIR/.venv/bin/python"
 ```
 
-也可使用 `--data-root`、`--eval-root`、`--unilip-python` 显式覆盖。旧别名 `DATA_ROOT`、`CSGO_EVAL_ROOT` 仍支持；不要同时设置相互冲突的别名。只查看实际解析结果、不执行训练或评测：
+也可使用 `--data-root`、`--eval-root`、`--eval-python`（兼容 `--unilip-python`）显式覆盖。旧别名 `DATA_ROOT`、`CSGO_EVAL_ROOT` 仍支持；不要同时设置相互冲突的别名。只查看实际解析结果、不执行训练或评测：
 
 ```bash
 bash scripts/run_csgo_seen10.sh train \
@@ -158,7 +189,7 @@ bash scripts/run_csgo_seen10.sh eval --seed 1
 legacy 默认推理取 validation `best`，默认 batch 来自配置的 `training.eval_batch_size=4`。`scripts/run_csgo_seen10.sh` 的模式专用参数可放在 `--` 后，例如 `infer --seed 1 -- --batch-size 4`。已有预测按样本 identity 续写，`inference_provenance.json` 会核对 checkpoint 与 seed。若仅重新评测现有 seed 0 的 20,000 条预测，应直接调用共享评测器并选择未使用的输出目录：
 
 ```bash
-"${UNILIP_PYTHON:-.venv/bin/python}" \
+"${CSGO_EVAL_PYTHON:-${UNILIP_PYTHON:-${SHARED_EVAL_DIR:-../csgo_benchmark_v2_eval_general}/.venv/bin/python}}" \
   "${SHARED_EVAL_DIR:-../csgo_benchmark_v2_eval_general}/run_eval.py" localization \
   --pred-root outputs/csgo_benchmark_v2_seen10/RDT/seed_0/localization \
   --data-root "${CSGO_DATA_ROOT:-../UniLIP/data/csgo_benchmark_v2}" \

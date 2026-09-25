@@ -189,12 +189,12 @@ smoke在每次保存时即写`smoke_only.json`，正式推理拒绝使用。
 | train_seen10.py | CLI/YAML解析、原始参数记录、预算/节点校验、dry-run与smoke边界 |
 | infer_seen10.py | aligned默认late、seed42/batch1/单进程、求解器provenance、标准预测和coverage |
 | scripts/run_csgo_seen10.sh | 所选YAML决定默认seed/输出目录；eval调用共享原evaluator |
-| scripts/csgo_paths.py | 跨服务器数据/评测路径解析；CLI、环境变量覆盖及旧默认路径的迁移回退，不改写实验 YAML |
+| scripts/csgo_paths.py | 跨服务器数据/评测目录解析；评测解释器按 OpenVLA 优先级选择，默认使用统一 evaluator 环境 |
 | scripts/setup_csgo_seen10.sh | 创建或复用项目环境，检查依赖；不要求另一项目的环境存在 |
 | train/csgo_visualize.py | 固定种子按地图取样；GT只供后处理 |
 | scripts/export_unilip_seen_predictions.py | Z epsilon及预测格式转换，不修改evaluator |
 
-数据/评测路径按显式CLI、环境变量、YAML的顺序解析；原机器默认路径不可用时回退到同级数据/评测目录和项目 Python，自定义路径不自动替换。训练与推理复用同一解析器。此变更不修改已保存协议中的 YAML，也不放宽跨服务器恢复校验。
+数据/评测目录按显式CLI、环境变量、YAML的顺序解析；原机器默认目录不可用时回退到同级数据/评测目录，自定义路径不自动替换。评测 Python 按 `--eval-python`（兼容 `--unilip-python`）→ `CSGO_EVAL_PYTHON` → `UNILIP_PYTHON` → YAML `unilip_python` → `<shared_eval_dir>/.venv/bin/python` 选择；不探测、不自动安装、不回退到模型环境。当前两份 YAML 的 `unilip_python: null` 启用统一默认；旧 YAML 的显式解释器仍保留。训练与推理的数据路径共用解析器；没有改写已保存协议或放宽恢复校验。
 显式CLI seed等覆盖YAML默认；YAML training映射为native参数后，透传参数最后解析。
 aligned随后校验最终运行值，违反固定协议的覆盖报错，不能只凭YAML认定实际值。
 审计记录raw_config、原始CLI/native argv、resolved_args、optimizer实际组和checkpoint状态。
@@ -348,3 +348,12 @@ fe217f4491ea882b0b52df1cb23ae4e8a11c1328ed29f2ed712e02aad2c02102
 - 10 项准备脚本检查与 4 项 OpenCV 模拟检查通过，包括混装修复、重复执行不重装、损坏的 headless 导入、卸载/安装失败传播。
 - 临时目录实际安装 headless wheel，使用子进程阻断 libGL：原 GUI OpenCV 导入失败，headless OpenCV 与 RDT 增强正常运行。64 次固定 occurrence 覆盖颜色、corruption、组合及不增强，和原环境输出 SHA256 一致：`cd1c755d3d5f3ef854204e810d31f7a178153d2baae681effafe6b0739858782`。这验证本次样本上的一致性，不代表所有平台逐位等价。
 - 实测摘要见 [.cache/csgo_seen10/opencv_headless_acceptance_20260925.json](.cache/csgo_seen10/opencv_headless_acceptance_20260925.json)。本机现有 `.venv` 未修改，其中也检测到 GUI/headless 混装，新 `--check` 正确拒绝该状态；只有用户手动执行 setup 才会修复。本轮仅在 `/tmp` 安装 OpenCV 测试包，没有下载模型或启动正式任务。
+
+### 9.8 2026-09-25 与 OpenVLA 对齐评测环境优先级
+
+依据本机 `openvla-oft/csgo_seen10/paths.py::evaluator_python`、`cli.py` 及 `runner.py::eval_command`，RDT wrapper 和路径解析器统一为 CLI → `CSGO_EVAL_PYTHON` → `UNILIP_PYTHON` → YAML → 通用评测器 `.venv`。新增 `--eval-python`，保留旧参数和 `unilip_python` 输出字段，路径打印新增同值的 `evaluator_python`。显式 Python 不探测、不回退，缺少解释器由进程启动报错；RDT 不负责安装或校验评测环境。
+
+- legacy/aligned 两份 YAML 的 `unilip_python` 改为 null；新建 tiny fixture 也使用 null，从所选评测器目录推导解释器。
+- YAML 结构比较确认仅评测解释器字段变化；训练/推理超参数、4000/8000/12000/16000/19500 保存节点没有变化。完整配置哈希仍严格校验，因此恢复旧 aligned checkpoint 必须使用其原配置；评测可通过新 CLI/env 覆盖环境，无需改动旧配置。
+- 9 项路径检查与 4 项 aligned 入口检查通过，覆盖两种 CLI 别名、两种环境变量的优先级、YAML 覆盖、评测器目录联动、symlink 保留、不探测显式路径、缺失解释器不回退。
+- 未设置解释器覆盖时，当前主机的路径打印确认评测使用 `/home/jiahao/task/csgo_benchmark_v2_eval_general/.venv/bin/python`。shell/文档命令语法与 diff 检查通过；没有安装环境、启动训练或运行正式评测。
