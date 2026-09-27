@@ -160,9 +160,9 @@ bash scripts/run_csgo_seen10.sh eval \
 训练从已经完整保存的最新 checkpoint 恢复时，用相同的配置与输出目录：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python train_seen10.py train \
-  --config configs/csgo_seen10_aligned.yaml \
-  --resume-from-checkpoint latest
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python train_seen10.py train --config configs/csgo_seen10_aligned.yaml --resume-from-checkpoint latest
+
+CUDA_VISIBLE_DEVICES=4 nohup .venv/bin/python train_seen10.py train --config configs/csgo_seen10_aligned.yaml --resume-from-checkpoint latest >rdt_aligned.nohup.out1 2>&1 &
 ```
 
 若失败后需要从 base 重新开始，入口会检查实际输出目录和 checkpoint 目录是否非空。新默认下 checkpoint、语言缓存和运行元数据均在 `outputs/csgo_aligned_aug_v1/RDT/seed_42` 内；确认旧训练进程已退出后，归档整个运行目录即可。旧配置使用分离的 checkpoint root 时，须同时检查并归档 outputs 与旧 checkpoint 运行目录；只清理 outputs 不够。不要为绕过防覆盖检查改变 aligned 的 seed，也不要将只有初始化文件的目录当成可恢复 checkpoint。错误信息会列出实际非空的目录。
